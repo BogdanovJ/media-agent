@@ -1,0 +1,16 @@
+# Conservative profile: large-file compatibility is NOT yet established.
+output_root: /mnt/downloads/media-agent-ready
+quarantine_root: /mnt/downloads/deleted
+download_root: /mnt/downloads
+state_db: /var/lib/media-agent/journal.sqlite3
+poll_seconds: 60
+cleanup_days: 7
+# Start in observation mode. Enable only after reviewing logs and test results.
+process_enabled: false
+cleanup_enabled: false
+# Do not automatically delete qBittorrent records or originals until verified.
+finalize_enabled: false
+ffmpeg_threads: 2
+# Files larger than this are flagged, not automatically split/transcoded.
+review_over_bytes: 4294967296
+min_free_bytes: 10737418240
