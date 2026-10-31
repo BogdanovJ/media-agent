@@ -260,6 +260,138 @@ class Quarantine:
 
         return target
 
+    def recover(self):
+        """
+        Reconcile interrupted quarantine moves.
+
+        Looks for quarantine_intent events without a
+        corresponding completed quarantine operation.
+
+        Recovery rules:
+        - Original exists, target missing: already safe.
+        - Original missing, target exists: restore original.
+        - Both exist: report conflict, do not modify.
+        - Neither exists: report missing files.
+
+        Never deletes files during recovery.
+        """
+
+        cursor = self.journal.db.execute("""
+            SELECT e.torrent_hash, e.source, e.detail
+            FROM events e
+            JOIN jobs j
+              ON j.torrent_hash = e.torrent_hash
+             AND j.source = e.source
+            WHERE e.event = 'quarantine_intent'
+              AND j.status = 'done'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM events later
+                  WHERE later.torrent_hash = e.torrent_hash
+                    AND later.source = e.source
+                    AND later.id > e.id
+                    AND later.event IN (
+                        'quarantined',
+                        'quarantine_recovered'
+                    )
+              )
+            ORDER BY e.id
+            """)
+
+        recovered = 0
+
+        for torrent_hash, source_name, target_name in cursor.fetchall():
+            source = Path(source_name)
+            target = Path(target_name)
+
+            # Validate both recorded paths before touching files.
+            try:
+                expected = self.destination(
+                    torrent_hash,
+                    source,
+                )
+
+                if target != expected:
+                    raise ValueError(
+                        "Journal destination does not match " "expected quarantine path"
+                    )
+
+            except ValueError:
+                log.critical(
+                    "Unsafe quarantine recovery record: %s",
+                    source,
+                    exc_info=True,
+                )
+                continue
+
+            source_exists = source.exists() or source.is_symlink()
+            target_exists = target.exists() or target.is_symlink()
+
+            if source_exists and not target_exists:
+                # No move occurred, or rollback already succeeded.
+                self.journal.event(
+                    torrent_hash,
+                    source_name,
+                    "quarantine_recovered",
+                    "Original already present",
+                )
+                recovered += 1
+                continue
+
+            if not source_exists and target_exists:
+                source.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                try:
+                    # Fail rather than overwrite a destination
+                    # that appeared during recovery.
+                    if source.exists() or source.is_symlink():
+                        raise FileExistsError(source)
+
+                    os.rename(target, source)
+
+                    self.journal.event(
+                        torrent_hash,
+                        source_name,
+                        "quarantine_recovered",
+                        "Original restored",
+                    )
+
+                    recovered += 1
+
+                    log.warning(
+                        "Recovered interrupted move: %s",
+                        source,
+                    )
+
+                except OSError:
+                    log.critical(
+                        "Manual quarantine recovery required: %s",
+                        source,
+                        exc_info=True,
+                    )
+
+                continue
+
+            if source_exists and target_exists:
+                log.critical(
+                    "Quarantine collision: both paths exist. " "source=%s target=%s",
+                    source,
+                    target,
+                )
+                continue
+
+            log.critical(
+                "Quarantine recovery failed: both paths missing. "
+                "source=%s target=%s",
+                source,
+                target,
+            )
+
+        return recovered
+
     def expired(self):
         """
         List expired quarantine journal records.
