@@ -436,10 +436,6 @@ def test_cross_filesystem_move_rejected(environment, monkeypatch):
 # --------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="move() does not yet reject jobs lacking done status",
-)
 def test_cannot_quarantine_uncompleted_job(environment):
     source = create_source(environment)
 
@@ -459,10 +455,6 @@ def test_cannot_quarantine_uncompleted_job(environment):
     assert source.exists()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="move() does not yet verify the output file exists",
-)
 def test_cannot_quarantine_when_output_missing(environment):
     source = create_source(environment)
     output = mark_completed(environment, source)
