@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-
+import sqlite3
 from app.journal import Journal
 from app.quarantine import Quarantine, is_within
 
@@ -468,3 +468,172 @@ def test_cannot_quarantine_when_output_missing(environment):
         )
 
     assert source.exists()
+
+
+# --------------------------------------------------
+# Crash recovery and filesystem safety
+# --------------------------------------------------
+
+
+def test_journal_failure_restores_original(environment, monkeypatch):
+    """
+    If journaling fails after a successful move,
+    the original must be restored.
+    """
+
+    source = create_source(
+        environment,
+        content=b"original video",
+    )
+
+    mark_completed(environment, source)
+
+    target = environment["quarantine"].destination(
+        TORRENT_HASH,
+        source,
+    )
+
+    original_insert = environment["journal"]._insert_event
+
+    def fail_completion_event(
+        torrent_hash,
+        source_path,
+        event,
+        detail="",
+    ):
+        if event == "quarantined":
+            raise sqlite3.OperationalError("Simulated journal write failure")
+
+        return original_insert(
+            torrent_hash,
+            source_path,
+            event,
+            detail,
+        )
+
+    monkeypatch.setattr(
+        environment["journal"],
+        "_insert_event",
+        fail_completion_event,
+    )
+
+    with pytest.raises(
+        sqlite3.OperationalError,
+        match="Simulated journal write failure",
+    ):
+        environment["quarantine"].move(
+            TORRENT_HASH,
+            source,
+        )
+
+    assert source.exists()
+    assert source.read_bytes() == b"original video"
+    assert not target.exists()
+
+    assert (
+        environment["journal"].status(
+            TORRENT_HASH,
+            str(source),
+        )
+        == "done"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Crash recovery reconciliation not implemented yet",
+)
+def test_recover_interrupted_quarantine_move(environment):
+    """
+    Simulate a crash after filesystem rename
+    but before the journal records completion.
+    """
+
+    source = create_source(
+        environment,
+        content=b"original video",
+    )
+
+    mark_completed(environment, source)
+
+    target = environment["quarantine"].destination(
+        TORRENT_HASH,
+        source,
+    )
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    environment["journal"].event(
+        TORRENT_HASH,
+        str(source),
+        "quarantine_intent",
+        str(target),
+    )
+
+    # Simulate the filesystem operation before a crash.
+    os.rename(source, target)
+
+    # Recovery should put the original back.
+    environment["quarantine"].recover()
+
+    assert source.exists()
+    assert source.read_bytes() == b"original video"
+    assert not target.exists()
+
+    assert (
+        environment["journal"].status(
+            TORRENT_HASH,
+            str(source),
+        )
+        == "done"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Atomic no-overwrite rename not implemented yet",
+)
+def test_destination_collision_during_rename(environment, monkeypatch):
+    """
+    Simulate another process creating the destination
+    after the initial existence check.
+    """
+
+    source = create_source(
+        environment,
+        content=b"original video",
+    )
+
+    mark_completed(environment, source)
+
+    target = environment["quarantine"].destination(
+        TORRENT_HASH,
+        source,
+    )
+
+    real_rename = os.rename
+
+    def collision_rename(src, dst):
+        if Path(src) == source and Path(dst) == target:
+            target.write_bytes(b"other process data")
+
+            # Production code must reject the collision
+            # without overwriting either file.
+            raise FileExistsError(target)
+
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(
+        os,
+        "rename",
+        collision_rename,
+    )
+
+    with pytest.raises(FileExistsError):
+        environment["quarantine"].move(
+            TORRENT_HASH,
+            source,
+        )
+
+    assert source.read_bytes() == b"original video"
+    assert target.read_bytes() == b"other process data"
