@@ -1,47 +1,366 @@
+import json
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
+
+JOB_STATUSES = {
+    "discovered",
+    "planned",
+    "running",
+    "validating",
+    "done",
+    "review",
+    "blocked",
+    "failed",
+    "missing",
+    "quarantined",
+    "purged",
+}
+
+RETRYABLE_STATUSES = {
+    "failed",
+    "blocked",
+    "interrupted",
+}
+
 
 def now():
     return datetime.now(timezone.utc).isoformat()
 
+
 class Journal:
+    """
+    Persistent SQLite journal for media processing.
+
+    Every job is identified by:
+        torrent_hash + source_path
+
+    The journal preserves:
+        - current processing state
+        - selected conversion action
+        - input and output paths
+        - failure and retry information
+        - quarantine and purge timestamps
+        - append-only event history
+    """
+
     def __init__(self, path):
-        self.db = sqlite3.connect(path)
-        self.db.execute("""CREATE TABLE IF NOT EXISTS jobs (
-            torrent_hash TEXT NOT NULL,
-            source TEXT NOT NULL,
-            status TEXT NOT NULL,
-            action TEXT,
-            reason TEXT,
-            output TEXT,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (torrent_hash, source)
-        )""")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            at TEXT NOT NULL,
-            torrent_hash TEXT,
-            source TEXT,
-            event TEXT NOT NULL,
-            detail TEXT
-        )""")
+        self.path = Path(path)
+        self.path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        self.db = sqlite3.connect(
+            self.path,
+            timeout=30,
+        )
+
+        self.db.execute("PRAGMA busy_timeout = 30000")
+        self.db.execute("PRAGMA journal_mode = WAL")
+        self.db.execute("PRAGMA foreign_keys = ON")
+
+        self._initialize()
+        self._recover_interrupted_jobs()
+
+    def _initialize(self):
+        # Retain compatibility with the original v0.1 schema.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                torrent_hash TEXT NOT NULL,
+                source TEXT NOT NULL,
+                status TEXT NOT NULL,
+                action TEXT,
+                reason TEXT,
+                output TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (torrent_hash, source)
+            )
+            """)
+
+        existing_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(jobs)")
+        }
+
+        migrations = {
+            "created_at": "TEXT",
+            "started_at": "TEXT",
+            "completed_at": "TEXT",
+            "quarantined_at": "TEXT",
+            "purge_after": "TEXT",
+            "purged_at": "TEXT",
+            "attempts": "INTEGER NOT NULL DEFAULT 0",
+            "last_error": "TEXT",
+            "metadata": "TEXT",
+        }
+
+        for column, definition in migrations.items():
+            if column not in existing_columns:
+                self.db.execute(
+                    f"ALTER TABLE jobs " f"ADD COLUMN {column} {definition}"
+                )
+
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                torrent_hash TEXT,
+                source TEXT,
+                event TEXT NOT NULL,
+                detail TEXT
+            )
+            """)
+
+        self.db.execute("""
+            CREATE INDEX IF NOT EXISTS
+            idx_jobs_status
+            ON jobs(status)
+            """)
+
+        self.db.execute("""
+            CREATE INDEX IF NOT EXISTS
+            idx_jobs_purge_after
+            ON jobs(purge_after)
+            """)
+
         self.db.commit()
 
-    def put(self, torrent_hash, source, status, action="", reason="", output=""):
-        self.db.execute("""INSERT INTO jobs VALUES (?,?,?,?,?,?,?)
-            ON CONFLICT(torrent_hash,source) DO UPDATE SET
-            status=excluded.status, action=excluded.action,
-            reason=excluded.reason, output=excluded.output,
-            updated_at=excluded.updated_at""",
-            (torrent_hash, source, status, action, reason, output, now()))
-        self.event(torrent_hash, source, status, reason)
+    def _recover_interrupted_jobs(self):
+        """
+        A restart cannot imply a successful conversion.
 
-    def event(self, torrent_hash, source, event, detail=""):
-        self.db.execute("INSERT INTO events(at,torrent_hash,source,event,detail) VALUES (?,?,?,?,?)",
-                        (now(), torrent_hash, source, event, detail))
+        Jobs previously marked running or validating
+        become interrupted, ready for explicit recovery.
+        """
+
+        rows = self.db.execute("""
+            SELECT torrent_hash, source, status
+            FROM jobs
+            WHERE status IN ('running', 'validating')
+            """).fetchall()
+
+        for torrent_hash, source, old_status in rows:
+            self.db.execute(
+                """
+                UPDATE jobs
+                SET status = 'interrupted',
+                    updated_at = ?,
+                    last_error = ?
+                WHERE torrent_hash = ?
+                  AND source = ?
+                """,
+                (
+                    now(),
+                    f"Interrupted during {old_status}",
+                    torrent_hash,
+                    source,
+                ),
+            )
+
+            self._insert_event(
+                torrent_hash,
+                source,
+                "interrupted",
+                f"Recovered from {old_status}",
+            )
+
+        self.db.commit()
+
+    def _insert_event(
+        self,
+        torrent_hash,
+        source,
+        event,
+        detail="",
+    ):
+        self.db.execute(
+            """
+            INSERT INTO events (
+                at,
+                torrent_hash,
+                source,
+                event,
+                detail
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                now(),
+                torrent_hash,
+                source,
+                event,
+                detail,
+            ),
+        )
+
+    def event(
+        self,
+        torrent_hash,
+        source,
+        event,
+        detail="",
+    ):
+        self._insert_event(
+            torrent_hash,
+            source,
+            event,
+            detail,
+        )
+        self.db.commit()
+
+    def put(
+        self,
+        torrent_hash,
+        source,
+        status,
+        action="",
+        reason="",
+        output="",
+        metadata=None,
+    ):
+        if status not in JOB_STATUSES:
+            raise ValueError(f"Invalid job status: {status}")
+
+        timestamp = now()
+
+        previous = self.db.execute(
+            """
+            SELECT status, attempts
+            FROM jobs
+            WHERE torrent_hash = ?
+              AND source = ?
+            """,
+            (torrent_hash, source),
+        ).fetchone()
+
+        attempts = previous[1] if previous else 0
+
+        if status == "running" and (previous is None or previous[0] != "running"):
+            attempts += 1
+
+        metadata_json = (
+            json.dumps(metadata, ensure_ascii=False) if metadata is not None else None
+        )
+
+        self.db.execute(
+            """
+            INSERT INTO jobs (
+                torrent_hash,
+                source,
+                status,
+                action,
+                reason,
+                output,
+                updated_at,
+                created_at,
+                started_at,
+                completed_at,
+                attempts,
+                last_error,
+                metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+            ON CONFLICT(torrent_hash, source)
+            DO UPDATE SET
+                status = excluded.status,
+                action = excluded.action,
+                reason = excluded.reason,
+                output = excluded.output,
+                updated_at = excluded.updated_at,
+                started_at = COALESCE(
+                    excluded.started_at,
+                    jobs.started_at
+                ),
+                completed_at = COALESCE(
+                    excluded.completed_at,
+                    jobs.completed_at
+                ),
+                attempts = excluded.attempts,
+                last_error = excluded.last_error,
+                metadata = COALESCE(
+                    excluded.metadata,
+                    jobs.metadata
+                )
+            """,
+            (
+                torrent_hash,
+                source,
+                status,
+                action,
+                reason,
+                output,
+                timestamp,
+                timestamp,
+                timestamp if status == "running" else None,
+                timestamp if status == "done" else None,
+                attempts,
+                reason if status == "failed" else None,
+                metadata_json,
+            ),
+        )
+
+        self._insert_event(
+            torrent_hash,
+            source,
+            status,
+            reason,
+        )
+
         self.db.commit()
 
     def status(self, torrent_hash, source):
-        row = self.db.execute("SELECT status FROM jobs WHERE torrent_hash=? AND source=?",
-                              (torrent_hash, source)).fetchone()
+        row = self.db.execute(
+            """
+            SELECT status
+            FROM jobs
+            WHERE torrent_hash = ?
+              AND source = ?
+            """,
+            (torrent_hash, source),
+        ).fetchone()
+
         return row[0] if row else None
+
+    def get(self, torrent_hash, source):
+        cursor = self.db.execute(
+            """
+            SELECT *
+            FROM jobs
+            WHERE torrent_hash = ?
+              AND source = ?
+            """,
+            (torrent_hash, source),
+        )
+
+        row = cursor.fetchone()
+
+        if row is None:
+            return None
+
+        columns = [item[0] for item in cursor.description]
+
+        result = dict(zip(columns, row))
+
+        if result.get("metadata"):
+            result["metadata"] = json.loads(result["metadata"])
+
+        return result
+
+    def jobs_for_torrent(self, torrent_hash):
+        cursor = self.db.execute(
+            """
+            SELECT *
+            FROM jobs
+            WHERE torrent_hash = ?
+            ORDER BY source
+            """,
+            (torrent_hash,),
+        )
+
+        columns = [item[0] for item in cursor.description]
+
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def close(self):
+        self.db.close()
