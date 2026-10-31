@@ -92,6 +92,9 @@ class Journal:
             "attempts": "INTEGER NOT NULL DEFAULT 0",
             "last_error": "TEXT",
             "metadata": "TEXT",
+            "source_size": "INTEGER",
+            "source_sha256": "TEXT",
+            "fingerprinted_at": "TEXT",
         }
 
         for column, definition in migrations.items():
@@ -361,6 +364,79 @@ class Journal:
         columns = [item[0] for item in cursor.description]
 
         return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def record_fingerprint(
+        self,
+        torrent_hash: str,
+        source: str,
+        size: int,
+        sha256: str,
+    ):
+        """
+        Store the verified identity of a quarantined file.
+
+        Only quarantined jobs may receive fingerprints.
+        Existing fingerprints cannot be silently replaced.
+        """
+
+        import re
+
+        if size < 0:
+            raise ValueError("Invalid file size")
+
+        if not re.fullmatch(r"[a-fA-F0-9]{64}", sha256):
+            raise ValueError("Invalid SHA-256 digest")
+
+        digest = sha256.lower()
+
+        job = self.get(torrent_hash, source)
+
+        if job is None:
+            raise ValueError("Unknown journal entry")
+
+        if job["status"] != "quarantined":
+            raise ValueError("File must be quarantined before fingerprinting")
+
+        if job["source_sha256"] is not None:
+            if job["source_sha256"] != digest or job["source_size"] != size:
+                raise ValueError("Existing fingerprint does not match")
+
+            return
+
+        timestamp = now()
+
+        with self.db:
+            cursor = self.db.execute(
+                """
+                UPDATE jobs
+                SET source_size = ?,
+                    source_sha256 = ?,
+                    fingerprinted_at = ?,
+                    updated_at = ?
+                WHERE torrent_hash = ?
+                  AND source = ?
+                  AND status = 'quarantined'
+                  AND source_sha256 IS NULL
+                """,
+                (
+                    size,
+                    digest,
+                    timestamp,
+                    timestamp,
+                    torrent_hash,
+                    source,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                raise RuntimeError("Fingerprint journal update rejected")
+
+            self._insert_event(
+                torrent_hash,
+                source,
+                "fingerprinted",
+                f"size={size} sha256={digest}",
+            )
 
     def close(self):
         self.db.close()
