@@ -15,6 +15,8 @@ Automatic deletion is deliberately not implemented here.
 import logging
 import os
 import re
+
+from .safe_move import move_no_replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -183,9 +185,9 @@ class Quarantine:
         if target.exists() or target.is_symlink():
             raise FileExistsError(target)
 
-        # Rename avoids the filesystem hard-link requirement.
-        # The source and target must be on the same filesystem.
-        os.rename(source, target)
+        # Atomically refuse an existing destination.
+        # Unsupported filesystem operations fail closed.
+        move_no_replace(source, target)
 
         moved_at = utcnow()
         purge_after = moved_at + timedelta(days=self.retention_days)
@@ -234,7 +236,7 @@ class Quarantine:
             # Restore original if possible.
             if target.exists() and not source.exists():
                 try:
-                    os.rename(target, source)
+                    move_no_replace(target, source)
 
                     log.warning(
                         "Restored original after journal failure: %s",
@@ -350,7 +352,7 @@ class Quarantine:
                     if source.exists() or source.is_symlink():
                         raise FileExistsError(source)
 
-                    os.rename(target, source)
+                    move_no_replace(target, source)
 
                     self.journal.event(
                         torrent_hash,

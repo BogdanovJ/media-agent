@@ -539,10 +539,6 @@ def test_journal_failure_restores_original(environment, monkeypatch):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Crash recovery reconciliation not implemented yet",
-)
 def test_recover_interrupted_quarantine_move(environment):
     """
     Simulate a crash after filesystem rename
@@ -589,16 +585,13 @@ def test_recover_interrupted_quarantine_move(environment):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Atomic no-overwrite rename not implemented yet",
-)
-def test_destination_collision_during_rename(environment, monkeypatch):
+def test_destination_collision_during_move(environment, monkeypatch):
     """
     Simulate another process creating the destination
-    after the initial existence check.
-    """
+    immediately before the no-overwrite move.
 
+    The move must fail without modifying either file.
+    """
     source = create_source(
         environment,
         content=b"original video",
@@ -611,22 +604,20 @@ def test_destination_collision_during_rename(environment, monkeypatch):
         source,
     )
 
-    real_rename = os.rename
+    from app import quarantine as quarantine_module
 
-    def collision_rename(src, dst):
+    real_move = quarantine_module.move_no_replace
+
+    def collision_move(src, dst):
         if Path(src) == source and Path(dst) == target:
             target.write_bytes(b"other process data")
 
-            # Production code must reject the collision
-            # without overwriting either file.
-            raise FileExistsError(target)
-
-        return real_rename(src, dst)
+        return real_move(src, dst)
 
     monkeypatch.setattr(
-        os,
-        "rename",
-        collision_rename,
+        quarantine_module,
+        "move_no_replace",
+        collision_move,
     )
 
     with pytest.raises(FileExistsError):
@@ -635,5 +626,16 @@ def test_destination_collision_during_rename(environment, monkeypatch):
             source,
         )
 
+    assert source.exists()
     assert source.read_bytes() == b"original video"
+
+    assert target.exists()
     assert target.read_bytes() == b"other process data"
+
+    assert (
+        environment["journal"].status(
+            TORRENT_HASH,
+            str(source),
+        )
+        == "done"
+    )
