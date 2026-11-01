@@ -262,3 +262,178 @@ def test_legacy_database_migration(tmp_path):
     assert "purge_after" in job
 
     journal.close()
+
+
+# --------------------------------------------------
+# Quarantined file fingerprint tests
+# --------------------------------------------------
+
+VALID_SHA256 = "a" * 64
+OTHER_SHA256 = "b" * 64
+
+
+def test_record_fingerprint(journal):
+    journal.put(HASH, SOURCE, "quarantined")
+
+    journal.record_fingerprint(
+        HASH,
+        SOURCE,
+        size=123456789,
+        sha256=VALID_SHA256,
+    )
+
+    job = journal.get(HASH, SOURCE)
+
+    assert job["source_size"] == 123456789
+    assert job["source_sha256"] == VALID_SHA256
+    assert job["fingerprinted_at"] is not None
+
+
+def test_fingerprint_survives_restart(tmp_path):
+    db_path = tmp_path / "journal.sqlite3"
+
+    first = Journal(db_path)
+
+    first.put(HASH, SOURCE, "quarantined")
+    first.record_fingerprint(
+        HASH,
+        SOURCE,
+        size=1024,
+        sha256=VALID_SHA256,
+    )
+
+    first.close()
+
+    second = Journal(db_path)
+    job = second.get(HASH, SOURCE)
+
+    assert job["source_size"] == 1024
+    assert job["source_sha256"] == VALID_SHA256
+
+    second.close()
+
+
+def test_duplicate_fingerprint_is_idempotent(journal):
+    journal.put(HASH, SOURCE, "quarantined")
+
+    journal.record_fingerprint(HASH, SOURCE, 1024, VALID_SHA256)
+
+    first_timestamp = journal.get(HASH, SOURCE)["fingerprinted_at"]
+
+    journal.record_fingerprint(HASH, SOURCE, 1024, VALID_SHA256)
+
+    job = journal.get(HASH, SOURCE)
+
+    assert job["source_sha256"] == VALID_SHA256
+    assert job["fingerprinted_at"] == first_timestamp
+
+
+def test_fingerprint_cannot_be_replaced(journal):
+    journal.put(HASH, SOURCE, "quarantined")
+
+    journal.record_fingerprint(HASH, SOURCE, 1024, VALID_SHA256)
+
+    with pytest.raises(
+        ValueError,
+        match="Existing fingerprint does not match",
+    ):
+        journal.record_fingerprint(HASH, SOURCE, 1024, OTHER_SHA256)
+
+    assert journal.get(HASH, SOURCE)["source_sha256"] == VALID_SHA256
+
+
+def test_fingerprint_size_cannot_change(journal):
+    journal.put(HASH, SOURCE, "quarantined")
+
+    journal.record_fingerprint(HASH, SOURCE, 1024, VALID_SHA256)
+
+    with pytest.raises(
+        ValueError,
+        match="Existing fingerprint does not match",
+    ):
+        journal.record_fingerprint(HASH, SOURCE, 2048, VALID_SHA256)
+
+
+@pytest.mark.parametrize(
+    "invalid_digest",
+    [
+        "",
+        "abc",
+        "z" * 64,
+        "a" * 63,
+        "a" * 65,
+    ],
+)
+def test_invalid_fingerprint_rejected(journal, invalid_digest):
+    journal.put(HASH, SOURCE, "quarantined")
+
+    with pytest.raises(
+        ValueError,
+        match="Invalid SHA-256 digest",
+    ):
+        journal.record_fingerprint(HASH, SOURCE, 1024, invalid_digest)
+
+
+def test_negative_fingerprint_size_rejected(journal):
+    journal.put(HASH, SOURCE, "quarantined")
+
+    with pytest.raises(ValueError, match="Invalid file size"):
+        journal.record_fingerprint(HASH, SOURCE, -1, VALID_SHA256)
+
+
+def test_unknown_job_cannot_be_fingerprinted(journal):
+    with pytest.raises(
+        ValueError,
+        match="Unknown journal entry",
+    ):
+        journal.record_fingerprint(HASH, SOURCE, 1024, VALID_SHA256)
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["planned", "running", "failed", "done", "review"],
+)
+def test_only_quarantined_jobs_accept_fingerprints(journal, status):
+    journal.put(HASH, SOURCE, status)
+
+    with pytest.raises(
+        ValueError,
+        match="File must be quarantined",
+    ):
+        journal.record_fingerprint(HASH, SOURCE, 1024, VALID_SHA256)
+
+
+def test_fingerprint_event_recorded(journal):
+    journal.put(HASH, SOURCE, "quarantined")
+
+    journal.record_fingerprint(HASH, SOURCE, 1024, VALID_SHA256)
+
+    events = journal.db.execute(
+        """
+        SELECT event, detail
+        FROM events
+        WHERE torrent_hash = ?
+          AND source = ?
+          AND event = 'fingerprinted'
+        """,
+        (HASH, SOURCE),
+    ).fetchall()
+
+    assert len(events) == 1
+    assert events[0][0] == "fingerprinted"
+    assert VALID_SHA256 in events[0][1]
+
+
+def test_fingerprint_normalizes_uppercase(journal):
+    journal.put(HASH, SOURCE, "quarantined")
+
+    journal.record_fingerprint(
+        HASH,
+        SOURCE,
+        size=1024,
+        sha256="ABCDEF" * 10 + "ABCD",
+    )
+
+    job = journal.get(HASH, SOURCE)
+
+    assert job["source_sha256"] == ("abcdef" * 10 + "abcd")
