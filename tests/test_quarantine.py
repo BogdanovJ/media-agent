@@ -829,12 +829,6 @@ def test_hash_failure_before_move_keeps_original(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Post-move fingerprint failure currently leaves " "the original in quarantine"
-    ),
-)
 def test_hash_failure_after_move_restores_original(
     environment,
     monkeypatch,

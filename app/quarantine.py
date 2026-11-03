@@ -215,26 +215,20 @@ class Quarantine:
         # Atomically refuse an existing destination.
         # Unsupported filesystem operations fail closed.
 
-        move_no_replace(source, target)
-
-        # Confirm that the file arrived unchanged.
-        target_size, target_sha256 = fingerprint(target)
-
-        if target_size != source_size or target_sha256 != source_sha256:
-            log.critical(
-                "Fingerprint mismatch after quarantine move: %s",
-                source,
-            )
-
-            # Leave the target untouched for manual recovery.
-            # Never register a mismatched file for purging.
-            raise RuntimeError("Quarantine fingerprint verification failed")
-
-        moved_at = utcnow()
-
-        purge_after = moved_at + timedelta(days=self.retention_days)
-
+        # The filesystem move, fingerprint verification and
+        # journal update must share the same recovery handler.
         try:
+            move_no_replace(source, target)
+
+            # Confirm the moved file still matches the original.
+            target_size, target_sha256 = fingerprint(target)
+
+            if target_size != source_size or target_sha256 != source_sha256:
+                raise RuntimeError("Quarantine fingerprint verification failed")
+
+            moved_at = utcnow()
+            purge_after = moved_at + timedelta(days=self.retention_days)
+
             cursor = self.journal.db.execute(
                 """
                 UPDATE jobs
