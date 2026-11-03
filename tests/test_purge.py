@@ -6,7 +6,6 @@ from app.journal import Journal
 from app.purge import Purge
 from app.quarantine import Quarantine
 
-
 HASH = "a" * 40
 NOW = datetime.now(timezone.utc)
 
@@ -95,9 +94,7 @@ def get_job(env, source):
 def test_newly_quarantined_file_is_retained(environment):
     source, target = prepare_file(environment)
 
-    result = environment["purge"].inspect(
-        get_job(environment, source)
-    )
+    result = environment["purge"].inspect(get_job(environment, source))
 
     assert result["status"] == "retained"
     assert target.exists()
@@ -170,9 +167,7 @@ def test_uncompleted_job_blocked(environment):
     )
     environment["journal"].db.commit()
 
-    result = environment["purge"].inspect(
-        get_job(environment, source)
-    )
+    result = environment["purge"].inspect(get_job(environment, source))
 
     assert result["status"] == "blocked"
 
@@ -191,9 +186,7 @@ def test_missing_deadline_blocked(environment):
     )
     environment["journal"].db.commit()
 
-    result = environment["purge"].inspect(
-        get_job(environment, source)
-    )
+    result = environment["purge"].inspect(get_job(environment, source))
 
     assert result["status"] == "blocked"
 
@@ -320,9 +313,7 @@ def test_scan_does_not_delete_files(environment):
         NOW - timedelta(days=1),
     )
 
-    reports = environment["purge"].scan(
-        current_time=NOW
-    )
+    reports = environment["purge"].scan(current_time=NOW)
 
     assert len(reports) == 1
     assert reports[0]["status"] == "eligible"
@@ -330,9 +321,7 @@ def test_scan_does_not_delete_files(environment):
     # Scanning must never delete anything.
     assert target.exists()
 
-    assert environment["journal"].status(
-        HASH, str(source)
-    ) == "quarantined"
+    assert environment["journal"].status(HASH, str(source)) == "quarantined"
 
 
 def test_summary(environment):
@@ -344,9 +333,7 @@ def test_summary(environment):
         NOW - timedelta(days=1),
     )
 
-    reports = environment["purge"].scan(
-        current_time=NOW
-    )
+    reports = environment["purge"].scan(current_time=NOW)
 
     summary = environment["purge"].summary(reports)
 
@@ -366,13 +353,223 @@ def test_repeated_scans_are_safe(environment):
         NOW - timedelta(days=1),
     )
 
-    first = environment["purge"].scan(
-        current_time=NOW
-    )
+    first = environment["purge"].scan(current_time=NOW)
 
-    second = environment["purge"].scan(
-        current_time=NOW
-    )
+    second = environment["purge"].scan(current_time=NOW)
 
     assert first == second
+    assert target.exists()
+
+
+# --------------------------------------------------
+# SHA-256 fingerprint protection
+# --------------------------------------------------
+
+
+def test_modified_file_same_size_blocked(environment):
+    source, target = prepare_file(environment)
+
+    set_deadline(
+        environment,
+        source,
+        NOW - timedelta(days=1),
+    )
+
+    original_size = target.stat().st_size
+
+    # Different contents, identical file size.
+    target.write_bytes(b"X" * original_size)
+
+    result = environment["purge"].inspect(
+        get_job(environment, source),
+        current_time=NOW,
+    )
+
+    assert result["status"] == "blocked"
+    assert "fingerprint mismatch" in result["reason"].lower()
+    assert target.exists()
+
+
+def test_modified_file_different_size_blocked(environment):
+    source, target = prepare_file(environment)
+
+    set_deadline(
+        environment,
+        source,
+        NOW - timedelta(days=1),
+    )
+
+    target.write_bytes(b"modified media with a different size")
+
+    result = environment["purge"].inspect(
+        get_job(environment, source),
+        current_time=NOW,
+    )
+
+    assert result["status"] == "blocked"
+    assert "size changed" in result["reason"].lower()
+
+
+@pytest.mark.parametrize(
+    "column",
+    ["source_sha256", "source_size"],
+)
+def test_missing_fingerprint_data_blocked(environment, column):
+    source, target = prepare_file(environment)
+
+    set_deadline(
+        environment,
+        source,
+        NOW - timedelta(days=1),
+    )
+
+    # Column name is from a fixed test-controlled list.
+    environment["journal"].db.execute(
+        f"""
+        UPDATE jobs
+        SET {column} = NULL
+        WHERE torrent_hash = ?
+          AND source = ?
+        """,
+        (HASH, str(source)),
+    )
+    environment["journal"].db.commit()
+
+    result = environment["purge"].inspect(
+        get_job(environment, source),
+        current_time=NOW,
+    )
+
+    assert result["status"] == "blocked"
+    assert target.exists()
+
+
+def test_invalid_fingerprint_blocked(environment):
+    source, _ = prepare_file(environment)
+
+    set_deadline(
+        environment,
+        source,
+        NOW - timedelta(days=1),
+    )
+
+    environment["journal"].db.execute(
+        """
+        UPDATE jobs
+        SET source_sha256 = ?
+        WHERE torrent_hash = ?
+          AND source = ?
+        """,
+        ("invalid-digest", HASH, str(source)),
+    )
+    environment["journal"].db.commit()
+
+    result = environment["purge"].inspect(
+        get_job(environment, source),
+        current_time=NOW,
+    )
+
+    assert result["status"] == "blocked"
+
+
+def test_fingerprint_read_failure_blocked(environment, monkeypatch):
+    from app import purge as purge_module
+
+    source, target = prepare_file(environment)
+
+    set_deadline(
+        environment,
+        source,
+        NOW - timedelta(days=1),
+    )
+
+    def fail_fingerprint(path, *args, **kwargs):
+        raise OSError("Simulated SMB read failure")
+
+    monkeypatch.setattr(
+        purge_module,
+        "fingerprint",
+        fail_fingerprint,
+    )
+
+    result = environment["purge"].inspect(
+        get_job(environment, source),
+        current_time=NOW,
+    )
+
+    assert result["status"] == "blocked"
+    assert "verification failed" in result["reason"].lower()
+    assert target.exists()
+
+
+def test_symlinked_quarantine_parent_blocked(environment, tmp_path):
+    source, target = prepare_file(
+        environment,
+        name="Series/Season 3/episode.mp4",
+    )
+
+    set_deadline(
+        environment,
+        source,
+        NOW - timedelta(days=1),
+    )
+
+    # Move the real directory outside the quarantine tree
+    # and replace its former location with a symlink.
+    season = target.parent
+    moved_directory = tmp_path / "moved-season"
+
+    season.rename(moved_directory)
+    season.symlink_to(moved_directory, target_is_directory=True)
+
+    result = environment["purge"].inspect(
+        get_job(environment, source),
+        current_time=NOW,
+    )
+
+    assert result["status"] == "blocked"
+    assert moved_directory.joinpath("episode.mp4").exists()
+
+
+def test_matching_fingerprint_eligible(environment):
+    source, target = prepare_file(environment)
+
+    set_deadline(
+        environment,
+        source,
+        NOW - timedelta(days=1),
+    )
+
+    job = get_job(environment, source)
+
+    assert job["source_sha256"] is not None
+    assert job["source_size"] == target.stat().st_size
+
+    result = environment["purge"].inspect(
+        job,
+        current_time=NOW,
+    )
+
+    assert result["status"] == "eligible"
+    assert "sha-256 verified" in result["reason"].lower()
+    assert target.exists()
+
+
+def test_fingerprint_scan_never_modifies_journal(environment):
+    source, target = prepare_file(environment)
+
+    set_deadline(
+        environment,
+        source,
+        NOW - timedelta(days=1),
+    )
+
+    before = environment["journal"].get(HASH, str(source))
+
+    reports = environment["purge"].scan(current_time=NOW)
+
+    after = environment["journal"].get(HASH, str(source))
+
+    assert reports[0]["status"] == "eligible"
+    assert before == after
     assert target.exists()
