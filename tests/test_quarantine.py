@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 import sqlite3
+import hashlib
 from app.journal import Journal
 from app.quarantine import Quarantine, is_within
 
@@ -631,6 +632,259 @@ def test_destination_collision_during_move(environment, monkeypatch):
 
     assert target.exists()
     assert target.read_bytes() == b"other process data"
+
+    assert (
+        environment["journal"].status(
+            TORRENT_HASH,
+            str(source),
+        )
+        == "done"
+    )
+
+
+# --------------------------------------------------
+# SHA-256 fingerprint verification
+# --------------------------------------------------
+
+
+def test_quarantine_records_sha256(environment):
+    original = b"original video content"
+
+    source = create_source(
+        environment,
+        content=original,
+    )
+
+    mark_completed(environment, source)
+
+    target = environment["quarantine"].move(
+        TORRENT_HASH,
+        source,
+    )
+
+    job = environment["journal"].get(
+        TORRENT_HASH,
+        str(source),
+    )
+
+    expected_hash = hashlib.sha256(original).hexdigest()
+
+    assert job["status"] == "quarantined"
+    assert job["source_size"] == len(original)
+    assert job["source_sha256"] == expected_hash
+    assert job["fingerprinted_at"] is not None
+
+    assert target.read_bytes() == original
+
+
+def test_fingerprint_event_recorded(environment):
+    source = create_source(environment)
+
+    mark_completed(environment, source)
+
+    environment["quarantine"].move(
+        TORRENT_HASH,
+        source,
+    )
+
+    events = (
+        environment["journal"]
+        .db.execute(
+            """
+        SELECT event
+        FROM events
+        WHERE torrent_hash = ?
+          AND source = ?
+        ORDER BY id
+        """,
+            (TORRENT_HASH, str(source)),
+        )
+        .fetchall()
+    )
+
+    event_names = [row[0] for row in events]
+
+    assert "quarantine_intent" in event_names
+    assert "quarantined" in event_names
+    assert "fingerprinted" in event_names
+
+
+def test_modified_quarantine_file_detected(environment):
+    from app.quarantine import fingerprint
+
+    source = create_source(
+        environment,
+        content=b"original video",
+    )
+
+    mark_completed(environment, source)
+
+    target = environment["quarantine"].move(
+        TORRENT_HASH,
+        source,
+    )
+
+    job = environment["journal"].get(
+        TORRENT_HASH,
+        str(source),
+    )
+
+    target.write_bytes(b"modified video")
+
+    size, sha256 = fingerprint(target)
+
+    assert size != job["source_size"] or sha256 != job["source_sha256"]
+
+    # This test detects modification.
+    # Enforcement during purge comes next.
+
+
+def test_fingerprint_survives_journal_restart(environment):
+    source = create_source(environment)
+
+    mark_completed(environment, source)
+
+    target = environment["quarantine"].move(
+        TORRENT_HASH,
+        source,
+    )
+
+    original_job = environment["journal"].get(
+        TORRENT_HASH,
+        str(source),
+    )
+
+    from app.journal import Journal
+
+    # Open a second journal connection to simulate restart.
+    restarted = Journal(environment["journal"].path)
+
+    try:
+        recovered_job = restarted.get(
+            TORRENT_HASH,
+            str(source),
+        )
+
+        assert recovered_job["source_sha256"] == original_job["source_sha256"]
+
+        assert recovered_job["source_size"] == original_job["source_size"]
+
+        assert recovered_job["status"] == "quarantined"
+        assert target.exists()
+
+    finally:
+        restarted.close()
+
+
+# --------------------------------------------------
+# Fingerprint failure handling
+# --------------------------------------------------
+
+
+def test_hash_failure_before_move_keeps_original(
+    environment,
+    monkeypatch,
+):
+    from app import quarantine as quarantine_module
+
+    source = create_source(
+        environment,
+        content=b"original video",
+    )
+
+    mark_completed(environment, source)
+
+    target = environment["quarantine"].destination(
+        TORRENT_HASH,
+        source,
+    )
+
+    def fail_fingerprint(path, *args, **kwargs):
+        raise OSError("Simulated read failure")
+
+    monkeypatch.setattr(
+        quarantine_module,
+        "fingerprint",
+        fail_fingerprint,
+    )
+
+    with pytest.raises(
+        OSError,
+        match="Simulated read failure",
+    ):
+        environment["quarantine"].move(
+            TORRENT_HASH,
+            source,
+        )
+
+    assert source.exists()
+    assert not target.exists()
+
+    assert (
+        environment["journal"].status(
+            TORRENT_HASH,
+            str(source),
+        )
+        == "done"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Post-move fingerprint failure currently leaves " "the original in quarantine"
+    ),
+)
+def test_hash_failure_after_move_restores_original(
+    environment,
+    monkeypatch,
+):
+    from app import quarantine as quarantine_module
+
+    source = create_source(
+        environment,
+        content=b"original video",
+    )
+
+    mark_completed(environment, source)
+
+    target = environment["quarantine"].destination(
+        TORRENT_HASH,
+        source,
+    )
+
+    real_fingerprint = quarantine_module.fingerprint
+    calls = 0
+
+    def fail_second_fingerprint(path, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+
+        if calls == 2:
+            raise OSError("Simulated verification read failure")
+
+        return real_fingerprint(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        quarantine_module,
+        "fingerprint",
+        fail_second_fingerprint,
+    )
+
+    with pytest.raises(
+        OSError,
+        match="Simulated verification read failure",
+    ):
+        environment["quarantine"].move(
+            TORRENT_HASH,
+            source,
+        )
+
+    # Desired future behaviour:
+    # An unsuccessful move must restore the original.
+    assert source.exists()
+    assert source.read_bytes() == b"original video"
+    assert not target.exists()
 
     assert (
         environment["journal"].status(
