@@ -15,6 +15,7 @@ Automatic deletion is deliberately not implemented here.
 import logging
 import os
 import re
+import hashlib
 
 from .safe_move import move_no_replace
 from datetime import datetime, timedelta, timezone
@@ -34,6 +35,31 @@ def is_within(path: Path, root: Path) -> bool:
     root = Path(root).resolve()
 
     return path != root and root in path.parents
+
+
+def fingerprint(path, chunk_size=4 * 1024 * 1024):
+    """
+    Calculate SHA-256 and size without loading the entire
+    video into memory.
+
+    Returns:
+        (size_bytes, sha256_hex)
+    """
+
+    path = Path(path)
+
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Fingerprint source must be a regular file")
+
+    digest = hashlib.sha256()
+    size = 0
+
+    with path.open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+            size += len(chunk)
+
+    return size, digest.hexdigest()
 
 
 class Quarantine:
@@ -172,8 +198,9 @@ class Quarantine:
         if os.stat(source).st_dev != os.stat(target.parent).st_dev:
             raise OSError("Source and quarantine must share a filesystem")
 
-        # An intent record provides an audit trail if the
-        # process crashes during the filesystem operation.
+        # Capture the original's identity before movement.
+        source_size, source_sha256 = fingerprint(source)
+
         self.journal.event(
             torrent_hash,
             str(source),
@@ -187,9 +214,24 @@ class Quarantine:
 
         # Atomically refuse an existing destination.
         # Unsupported filesystem operations fail closed.
+
         move_no_replace(source, target)
 
+        # Confirm that the file arrived unchanged.
+        target_size, target_sha256 = fingerprint(target)
+
+        if target_size != source_size or target_sha256 != source_sha256:
+            log.critical(
+                "Fingerprint mismatch after quarantine move: %s",
+                source,
+            )
+
+            # Leave the target untouched for manual recovery.
+            # Never register a mismatched file for purging.
+            raise RuntimeError("Quarantine fingerprint verification failed")
+
         moved_at = utcnow()
+
         purge_after = moved_at + timedelta(days=self.retention_days)
 
         try:
@@ -199,14 +241,21 @@ class Quarantine:
                 SET status = 'quarantined',
                     quarantined_at = ?,
                     purge_after = ?,
-                    updated_at = ?
+                    updated_at = ?,
+                    source_size = ?,
+                    source_sha256 = ?,
+                    fingerprinted_at = ?
                 WHERE torrent_hash = ?
                   AND source = ?
                   AND status = 'done'
+                  AND source_sha256 IS NULL
                 """,
                 (
                     moved_at.isoformat(),
                     purge_after.isoformat(),
+                    moved_at.isoformat(),
+                    source_size,
+                    source_sha256,
                     moved_at.isoformat(),
                     torrent_hash,
                     str(source),
@@ -221,6 +270,13 @@ class Quarantine:
                 str(source),
                 "quarantined",
                 str(target),
+            )
+
+            self.journal._insert_event(
+                torrent_hash,
+                str(source),
+                "fingerprinted",
+                f"size={source_size} sha256={source_sha256}",
             )
 
             self.journal.db.commit()
