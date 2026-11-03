@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import os
 
 from app.journal import Journal
 from app.purge import Purge
@@ -572,4 +573,282 @@ def test_fingerprint_scan_never_modifies_journal(environment):
 
     assert reports[0]["status"] == "eligible"
     assert before == after
+    assert target.exists()
+
+
+# --------------------------------------------------
+# Permanent deletion — safety and lifecycle
+# --------------------------------------------------
+
+
+def test_purge_disabled_by_default(environment):
+    source, target = prepare_file(environment)
+
+    set_deadline(
+        environment,
+        source,
+        NOW - timedelta(days=1),
+    )
+
+    with pytest.raises(
+        PermissionError,
+        match="Permanent deletion is disabled",
+    ):
+        environment["purge"].delete_expired(
+            HASH,
+            str(source),
+        )
+
+    assert target.exists()
+    assert environment["journal"].status(HASH, str(source)) == "quarantined"
+
+
+def test_successful_permanent_purge(environment):
+    source, target = prepare_file(environment)
+
+    set_deadline(
+        environment,
+        source,
+        NOW - timedelta(days=1),
+    )
+
+    original_size = target.stat().st_size
+
+    result = environment["purge"].delete_expired(
+        HASH,
+        str(source),
+        enabled=True,
+    )
+
+    assert result["status"] == "purged"
+    assert result["bytes_deleted"] == original_size
+
+    assert not target.exists()
+    assert not source.exists()
+
+    job = environment["journal"].get(HASH, str(source))
+
+    assert job["status"] == "purged"
+    assert job["purged_at"] is not None
+
+    events = (
+        environment["journal"]
+        .db.execute(
+            """
+        SELECT event
+        FROM events
+        WHERE torrent_hash = ?
+          AND source = ?
+        ORDER BY id
+        """,
+            (HASH, str(source)),
+        )
+        .fetchall()
+    )
+
+    event_names = [row[0] for row in events]
+
+    assert "purge_intent" in event_names
+    assert "purged" in event_names
+
+
+def test_purge_before_deadline_rejected(environment):
+    source, target = prepare_file(environment)
+
+    with pytest.raises(
+        ValueError,
+        match="Retention period not expired",
+    ):
+        environment["purge"].delete_expired(
+            HASH,
+            str(source),
+            enabled=True,
+        )
+
+    assert target.exists()
+
+    assert environment["journal"].status(HASH, str(source)) == "quarantined"
+
+
+def test_modified_file_cannot_be_deleted(environment):
+    source, target = prepare_file(environment)
+
+    set_deadline(
+        environment,
+        source,
+        NOW - timedelta(days=1),
+    )
+
+    # Modify content without changing size.
+    original_size = target.stat().st_size
+    target.write_bytes(b"X" * original_size)
+
+    with pytest.raises(
+        ValueError,
+        match="fingerprint mismatch",
+    ):
+        environment["purge"].delete_expired(
+            HASH,
+            str(source),
+            enabled=True,
+        )
+
+    assert target.exists()
+
+    assert environment["journal"].status(HASH, str(source)) == "quarantined"
+
+
+def test_missing_fingerprint_prevents_deletion(environment):
+    source, target = prepare_file(environment)
+
+    set_deadline(
+        environment,
+        source,
+        NOW - timedelta(days=1),
+    )
+
+    environment["journal"].db.execute(
+        """
+        UPDATE jobs
+        SET source_sha256 = NULL
+        WHERE torrent_hash = ?
+          AND source = ?
+        """,
+        (HASH, str(source)),
+    )
+    environment["journal"].db.commit()
+
+    with pytest.raises(
+        ValueError,
+        match="SHA-256 fingerprint",
+    ):
+        environment["purge"].delete_expired(
+            HASH,
+            str(source),
+            enabled=True,
+        )
+
+    assert target.exists()
+
+
+def test_purge_journal_failure_preserves_file(
+    environment,
+    monkeypatch,
+):
+    """
+    Failure to record deletion intent must prevent unlink.
+    """
+
+    source, target = prepare_file(environment)
+
+    set_deadline(
+        environment,
+        source,
+        NOW - timedelta(days=1),
+    )
+
+    journal = environment["journal"]
+    original_insert = journal._insert_event
+
+    def fail_purge_intent(
+        torrent_hash,
+        source_path,
+        event,
+        detail="",
+    ):
+        if event == "purge_intent":
+            raise RuntimeError("Simulated journal failure")
+
+        return original_insert(
+            torrent_hash,
+            source_path,
+            event,
+            detail,
+        )
+
+    monkeypatch.setattr(
+        journal,
+        "_insert_event",
+        fail_purge_intent,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="Simulated journal failure",
+    ):
+        environment["purge"].delete_expired(
+            HASH,
+            str(source),
+            enabled=True,
+        )
+
+    # SQLite transaction must have rolled back.
+    assert journal.status(HASH, str(source)) == "quarantined"
+
+    # No filesystem deletion occurred.
+    assert target.exists()
+
+
+def test_interrupted_unlink_requires_reconciliation(
+    environment,
+    monkeypatch,
+):
+    """
+    Simulate filesystem failure after purge intent is
+    committed but before deletion succeeds.
+    """
+
+    source, target = prepare_file(environment)
+
+    set_deadline(
+        environment,
+        source,
+        NOW - timedelta(days=1),
+    )
+
+    real_unlink = os.unlink
+
+    def fail_target_unlink(path, *args, **kwargs):
+        if path == target.name and kwargs.get("dir_fd") is not None:
+            raise OSError("Simulated filesystem unlink failure")
+
+        return real_unlink(
+            path,
+            *args,
+            **kwargs,
+        )
+
+    # Keep global filesystem monkeypatching scoped.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "unlink", fail_target_unlink)
+
+        with pytest.raises(
+            OSError,
+            match="Simulated filesystem unlink failure",
+        ):
+            environment["purge"].delete_expired(
+                HASH,
+                str(source),
+                enabled=True,
+            )
+
+    journal = environment["journal"]
+
+    # The intent was committed before deletion.
+    assert journal.status(HASH, str(source)) == "purging"
+
+    # The file remains untouched.
+    assert target.exists()
+
+    # Automatic retry must be refused.
+    with pytest.raises(
+        ValueError,
+        match="Job is not quarantined",
+    ):
+        environment["purge"].delete_expired(
+            HASH,
+            str(source),
+            enabled=True,
+        )
+
     assert target.exists()

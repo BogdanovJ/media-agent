@@ -12,6 +12,8 @@ Physical file deletion is intentionally not implemented yet.
 
 import logging
 import re
+import os
+import stat
 from unittest import result
 
 from .quarantine import fingerprint, is_within
@@ -261,6 +263,237 @@ class Purge:
             )
 
         return results
+
+    def delete_expired(self, torrent_hash, source, enabled=False):
+        """
+        Permanently delete one expired, verified quarantine file.
+
+        Disabled by default.
+
+        Safety:
+        - Re-read the current SQLite journal entry.
+        - Re-run retention and fingerprint verification.
+        - Open the quarantine directory without following symlinks.
+        - Open the file without following symlinks.
+        - Verify the file through its open descriptor.
+        - Record deletion intent before unlinking.
+        - Never automatically retry interrupted purges.
+
+        This operation assumes the quarantine directory is
+        exclusively managed by media-agent.
+        """
+
+        if not enabled:
+            raise PermissionError("Permanent deletion is disabled")
+
+        job = self.journal.get(torrent_hash, source)
+
+        if job is None:
+            raise ValueError("No journal record for requested file")
+
+        # Inspect against the current time, not a supplied
+        # or previously cached eligibility report.
+        report = self.inspect(
+            job,
+            current_time=datetime.now(timezone.utc),
+        )
+
+        if report["status"] != "eligible":
+            raise ValueError(f"Purge rejected: {report['reason']}")
+
+        target = Path(report["target"])
+
+        # Recheck the expected path.
+        expected = (
+            self.quarantine_root
+            / torrent_hash.lower()
+            / Path(source).resolve().relative_to(self.download_root)
+        )
+
+        if target != expected:
+            raise ValueError("Quarantine destination mismatch")
+
+        expected_size = job["source_size"]
+        expected_sha256 = job["source_sha256"].lower()
+
+        # Walk from the trusted quarantine root using
+        # directory descriptors and O_NOFOLLOW.
+        # This prevents following symlinked child directories.
+        root_fd = os.open(
+            self.quarantine_root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+
+        directory_fd = root_fd
+        file_fd = None
+
+        try:
+            relative = target.relative_to(self.quarantine_root)
+
+            for component in relative.parts[:-1]:
+                next_fd = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+
+                if directory_fd != root_fd:
+                    os.close(directory_fd)
+
+                directory_fd = next_fd
+
+            filename = relative.name
+
+            file_fd = os.open(
+                filename,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+
+            before = os.fstat(file_fd)
+
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("Purge target is not a regular file")
+
+            if before.st_size != expected_size:
+                raise ValueError("Purge target size changed")
+
+            # Hash through the open descriptor, rather
+            # than reopening an untrusted pathname.
+            import hashlib
+
+            digest = hashlib.sha256()
+            actual_size = 0
+
+            while True:
+                chunk = os.read(
+                    file_fd,
+                    4 * 1024 * 1024,
+                )
+
+                if not chunk:
+                    break
+
+                digest.update(chunk)
+                actual_size += len(chunk)
+
+            after = os.fstat(file_fd)
+
+            if actual_size != expected_size or digest.hexdigest() != expected_sha256:
+                raise ValueError("Final SHA-256 verification failed")
+
+            if (
+                before.st_ino != after.st_ino
+                or before.st_dev != after.st_dev
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+                or before.st_ctime_ns != after.st_ctime_ns
+            ):
+                raise ValueError("File changed during verification")
+
+            # Confirm that the directory entry still
+            # refers to the verified file.
+            current = os.stat(
+                filename,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+
+            if (
+                current.st_ino != after.st_ino
+                or current.st_dev != after.st_dev
+                or not stat.S_ISREG(current.st_mode)
+            ):
+                raise ValueError("File identity changed before deletion")
+
+            # Persist intent before performing any
+            # irreversible filesystem operation.
+            timestamp = datetime.now(timezone.utc).isoformat()
+
+            with self.journal.db:
+                cursor = self.journal.db.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'purging',
+                        updated_at = ?
+                    WHERE torrent_hash = ?
+                      AND source = ?
+                      AND status = 'quarantined'
+                    """,
+                    (
+                        timestamp,
+                        torrent_hash,
+                        source,
+                    ),
+                )
+
+                if cursor.rowcount != 1:
+                    raise RuntimeError("Journal state changed before purge")
+
+                self.journal._insert_event(
+                    torrent_hash,
+                    source,
+                    "purge_intent",
+                    str(target),
+                )
+
+            # An unexpected failure from here leaves the
+            # job in 'purging', requiring reconciliation.
+            os.unlink(
+                filename,
+                dir_fd=directory_fd,
+            )
+
+            os.fsync(directory_fd)
+
+            finished_at = datetime.now(timezone.utc).isoformat()
+
+            with self.journal.db:
+                self.journal.db.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'purged',
+                        purged_at = ?,
+                        updated_at = ?
+                    WHERE torrent_hash = ?
+                      AND source = ?
+                      AND status = 'purging'
+                    """,
+                    (
+                        finished_at,
+                        finished_at,
+                        torrent_hash,
+                        source,
+                    ),
+                )
+
+                self.journal._insert_event(
+                    torrent_hash,
+                    source,
+                    "purged",
+                    str(target),
+                )
+
+            log.info(
+                "Permanently purged file: %s",
+                target,
+            )
+
+            return {
+                "status": "purged",
+                "source": source,
+                "target": str(target),
+                "bytes_deleted": actual_size,
+            }
+
+        finally:
+            if file_fd is not None:
+                os.close(file_fd)
+
+            if directory_fd != root_fd:
+                os.close(directory_fd)
+
+            os.close(root_fd)
 
     def summary(self, reports):
         """

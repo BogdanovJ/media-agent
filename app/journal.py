@@ -15,6 +15,7 @@ JOB_STATUSES = {
     "missing",
     "quarantined",
     "purged",
+    "purging",
 }
 
 RETRYABLE_STATUSES = {
