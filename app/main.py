@@ -9,6 +9,7 @@ import yaml
 from .compat import VIDEO_EXTS, decision
 from .journal import Journal
 from .qbit import Qbit
+from .safe_move import move_no_replace
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s"
@@ -43,23 +44,34 @@ def within(path, root):
     return p != r and r in p.parents
 
 
+def destination_for(src, action):
+    """Return the final path without changing the source directory structure."""
+    src = Path(src)
+    if action == "copy":
+        return src  # Already compatible: no duplicate is necessary.
+    if action in ("remux", "transcode"):
+        return src.with_suffix(".mp4")
+    raise ValueError(f"Unsupported conversion action: {action}")
+
+
 def convert(src, dest, action, threads):
     """
     Convert a video and publish it only after validation.
 
     The source is never modified.
-    The completed output is published atomically.
+    The completed output is published without replacing an existing file.
     """
 
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    partial = dest.with_name(dest.stem + ".partial" + dest.suffix)
+    partial = dest.with_name(dest.stem + ".media-agent.partial" + dest.suffix)
 
-    if dest.exists():
+    if src == dest:
+        raise ValueError("Refusing to convert a source onto itself")
+    if dest.exists() or dest.is_symlink():
         raise FileExistsError(f"Destination already exists: {dest}")
-
-    if partial.exists():
-        partial.unlink()
+    if partial.exists() or partial.is_symlink():
+        raise FileExistsError(f"Previous partial output requires inspection: {partial}")
 
     source_info = probe(src)
 
@@ -74,7 +86,7 @@ def convert(src, dest, action, threads):
                 "-hide_banner",
                 "-loglevel",
                 "warning",
-                "-y",
+                "-n",
                 "-i",
                 str(src),
                 "-map",
@@ -175,10 +187,9 @@ def convert(src, dest, action, threads):
         # Publish verified output
         # --------------------------------------
 
-        if dest.exists():
-            raise FileExistsError(f"Destination appeared during processing: {dest}")
-
-        partial.replace(dest)
+        # Publish without overwriting a file that appeared during conversion.
+        # move_no_replace either performs a no-clobber move or fails safely.
+        move_no_replace(partial, dest)
 
         log.info(
             "Verified output: %s (%.2f seconds)",
@@ -200,7 +211,9 @@ def convert(src, dest, action, threads):
 def process_torrent(q, t, cfg, journal):
     h = t["hash"]
     root = Path(cfg["download_root"]).resolve()
-    output_root = Path(cfg["output_root"]).resolve()
+    # Output is deliberately published alongside the original source.
+    # Neither the quarantine directory nor any other special directory may be a source.
+    quarantine_root = Path(cfg["quarantine_root"]).resolve()
     # qBittorrent file names are relative to the torrent's save_path.
     base = Path(t["save_path"]).resolve()
     if base != root and not within(base, root):
@@ -210,13 +223,16 @@ def process_torrent(q, t, cfg, journal):
         if entry.get("priority") == 0:
             continue
         name = entry["name"]
-        src = (base / name).resolve()
+        candidate = base / name
+        if candidate.is_symlink():
+            raise ValueError(f"Refusing symlink source: {candidate}")
+        src = candidate.resolve()
         if src.suffix.lower() not in VIDEO_EXTS:
             continue
         if (
             not within(src, root)
-            or within(src, output_root)
-            or within(src, cfg["quarantine_root"])
+            or src == quarantine_root
+            or within(src, quarantine_root)
         ):
             raise ValueError(f"Unsafe source path: {src}")
         if not src.is_file():
@@ -235,15 +251,18 @@ def process_torrent(q, t, cfg, journal):
         if not cfg["process_enabled"]:
             journal.put(h, str(src), "planned", action, reason)
             continue
-        relative = src.relative_to(root)
-        dest = output_root / relative.with_suffix(".mp4")
-        if dest.exists():
+        dest = destination_for(src, action)
+        if dest == src:
+            # No conversion is necessary; the original filename remains untouched.
+            journal.put(h, str(src), "done", action, reason, str(src))
+            continue
+        if dest.exists() or dest.is_symlink():
             journal.put(
                 h, str(src), "review", action, "Output already exists; manual review"
             )
             continue
         if (
-            shutil.disk_usage(output_root if output_root.exists() else root).free
+            shutil.disk_usage(src.parent).free
             < cfg["min_free_bytes"]
         ):
             journal.put(h, str(src), "blocked", action, "Insufficient free space")
@@ -255,8 +274,9 @@ def process_torrent(q, t, cfg, journal):
         except Exception as e:
             log.exception("Conversion failed: %s", src)
             journal.put(h, str(src), "failed", action, str(e))
-    # Intentionally NO automatic torrent removal/quarantine in v0.1.
-    # Requires a separate, verified transaction and retention implementation.
+    # Original files are intentionally kept untouched after publishing.
+    # Removal/quarantine requires a separate, journalled transaction; do not
+    # enable it until an entire multi-file torrent has been validated.
 
 
 def main():
