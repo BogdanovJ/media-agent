@@ -13,10 +13,14 @@ JOB_STATUSES = {
     "blocked",
     "failed",
     "missing",
+    "interrupted",
     "quarantined",
     "purged",
     "purging",
 }
+
+PROTECTED_STATUSES = {"quarantined", "purging", "purged"}
+
 
 RETRYABLE_STATUSES = {
     "failed",
@@ -237,6 +241,12 @@ class Journal:
             (torrent_hash, source),
         ).fetchone()
 
+        if previous and previous[0] in PROTECTED_STATUSES:
+            raise ValueError(
+                f"Cannot overwrite protected job status {previous[0]!r} with {status!r}; "
+                "use the explicit quarantine/purge lifecycle"
+            )
+
         attempts = previous[1] if previous else 0
 
         if status == "running" and (previous is None or previous[0] != "running"):
@@ -286,6 +296,7 @@ class Journal:
                     excluded.metadata,
                     jobs.metadata
                 )
+            WHERE jobs.status NOT IN ('quarantined', 'purging', 'purged')
             """,
             (
                 torrent_hash,
@@ -303,6 +314,10 @@ class Journal:
                 metadata_json,
             ),
         )
+
+        if self.db.execute("SELECT changes()").fetchone()[0] != 1:
+            self.db.rollback()
+            raise RuntimeError("Job state changed during update; protected state preserved")
 
         self._insert_event(
             torrent_hash,
