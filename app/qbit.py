@@ -5,20 +5,22 @@ explicit confirmation at the call site and never requests file deletion.
 """
 
 import re
+from urllib import response
 
 import requests
 
-
 # Only states representing completed, stable payloads. A torrent can be
 # reported under the API's 'completed' filter while checking or moving files.
-READY_STATES = frozenset({
-    "uploading",
-    "stalledUP",
-    "queuedUP",
-    "forcedUP",
-    "pausedUP",  # Older qBittorrent versions
-    "stoppedUP",  # Newer qBittorrent versions
-})
+READY_STATES = frozenset(
+    {
+        "uploading",
+        "stalledUP",
+        "queuedUP",
+        "forcedUP",
+        "pausedUP",  # Older qBittorrent versions
+        "stoppedUP",  # Newer qBittorrent versions
+    }
+)
 
 HASH_PATTERN = re.compile(r"^[a-fA-F0-9]{40}$")
 
@@ -33,8 +35,12 @@ class Qbit:
             timeout=15,
         )
         response.raise_for_status()
-        if response.text.strip() != "Ok.":
-            raise RuntimeError("qBittorrent login failed")
+
+        if not (
+            (response.status_code == 200 and response.text.strip() == "Ok.")
+            or response.status_code == 204
+        ):
+            raise RuntimeError(f"qBittorrent login failed: HTTP {response.status_code}")
 
     def completed(self):
         """Return completed, stable torrents for inspection.
@@ -53,7 +59,8 @@ class Qbit:
         if not isinstance(torrents, list):
             raise RuntimeError("Unexpected qBittorrent torrent-list response")
         return [
-            torrent for torrent in torrents
+            torrent
+            for torrent in torrents
             if isinstance(torrent, dict)
             and torrent.get("state") in READY_STATES
             and torrent.get("progress") == 1
@@ -75,7 +82,9 @@ class Qbit:
 
     @staticmethod
     def _check_hash(torrent_hash):
-        if not isinstance(torrent_hash, str) or not HASH_PATTERN.fullmatch(torrent_hash):
+        if not isinstance(torrent_hash, str) or not HASH_PATTERN.fullmatch(
+            torrent_hash
+        ):
             raise ValueError("Invalid torrent hash")
 
     def remove_record_only(self, torrent_hash, *, confirmed=False):
