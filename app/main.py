@@ -54,6 +54,10 @@ def destination_for(src, action):
     if action == "copy":
         return src  # Already compatible: no duplicate is necessary.
     if action in ("remux", "transcode"):
+        # An MP4 container can still need audio/video conversion. Never use
+        # its original filename as the output (including case-insensitive FS).
+        if src.suffix.lower() == ".mp4":
+            return src.with_name(src.stem + ".media-agent.mp4")
         return src.with_suffix(".mp4")
     raise ValueError(f"Unsupported conversion action: {action}")
 
@@ -243,6 +247,19 @@ def process_torrent(q, t, cfg, journal):
         ):
             raise ValueError(f"Unsafe source path: {src}")
         existing_status = journal.status(h, str(src))
+        if existing_status == "done" and src.suffix.lower() == ".mp4":
+            job = journal.get(h, str(src))
+            if (job["action"] in ("remux", "transcode")
+                    and job["output"] == str(src)):
+                # Repair only the historical self-output shortcut. Successful
+                # conversions and deliberately unchanged files stay completed.
+                journal.put(
+                    h, str(src), "interrupted", action=job["action"],
+                    reason="Correcting earlier completion: conversion was skipped because "
+                           "output matched the original MP4. Rechecking for a separate output.",
+                )
+                existing_status = "interrupted"
+                log.warning("Requeued incorrect MP4 completion: %s", src)
         # Do not regress protected journal states after originals are moved.
         if existing_status in ("done", "review", "quarantined", "purging", "purged"):
             continue
@@ -261,9 +278,13 @@ def process_torrent(q, t, cfg, journal):
             journal.put(h, str(src), "planned", action, reason)
             continue
         dest = destination_for(src, action)
+        if action == "copy":
+            journal.put(h, str(src), "done", action,
+                        "Already compatible; original retained, no conversion needed.", str(src))
+            continue
         if dest == src:
-            # No conversion is necessary; the original filename remains untouched.
-            journal.put(h, str(src), "done", action, reason, str(src))
+            journal.put(h, str(src), "review", action,
+                        "Conversion output must differ from the original; no conversion performed.")
             continue
         if dest.exists() or dest.is_symlink():
             journal.put(
@@ -279,7 +300,8 @@ def process_torrent(q, t, cfg, journal):
         journal.put(h, str(src), "running", action, reason)
         try:
             convert(src, dest, action, cfg["ffmpeg_threads"])
-            journal.put(h, str(src), "done", action, reason, str(dest))
+            journal.put(h, str(src), "done", action,
+                        f"Conversion completed and validated. Output: {dest}", str(dest))
         except Exception as e:
             log.exception("Conversion failed: %s", src)
             journal.put(h, str(src), "failed", action, str(e))

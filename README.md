@@ -5,7 +5,8 @@
 ## What will happen
 
 - Poll fully completed, stable qBittorrent torrents; remux/transcode when required.
-- Keep verified MP4 outputs beside the original files until **you remove them manually**.
+- Keep verified MP4 outputs beside the original files until **you remove them manually**. MP4 inputs needing conversion produce `<stem>.media-agent.mp4`; other containers produce `<stem>.mp4`. Existing outputs are never overwritten.
+- The worker rechecks historical MP4 jobs incorrectly marked done with remux/transcode action and the original path as output. It records a correction and preserves the original; genuinely completed conversions and compatible originals are not reprocessed.
 - Already-compatible files stay in place: they are the playable copy, not disposable originals.
 - Processing, finalization, and cleanup switches are enabled in the proposed configuration.
 - **Your TorrentMonitor updates season packs. Keep those hashes out of `retirement_allow_hashes`.** Moving their originals or removing their qBittorrent entries can interfere with future updates.
