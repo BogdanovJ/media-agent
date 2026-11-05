@@ -1,5 +1,7 @@
 import json
 import sqlite3
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +20,12 @@ JOB_STATUSES = {
     "purged",
     "purging",
 }
+
+NOTIFICATION_EVENTS = {
+    "done", "failed", "review", "blocked", "missing", "interrupted",
+    "quarantined", "purged", "torrent_retired",
+}
+
 
 PROTECTED_STATUSES = {"quarantined", "purging", "purged"}
 
@@ -131,6 +139,27 @@ class Journal:
             ON jobs(purge_after)
             """)
 
+        # Existing event history is deliberately not replayed on migration.
+        # Keep immutable payloads independent of later event-history pruning.
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS notification_outbox (
+                event_id INTEGER PRIMARY KEY,
+                event TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                available_at REAL NOT NULL DEFAULT 0,
+                claim_token TEXT,
+                delivered_at TEXT,
+                last_error TEXT
+            )
+            """)
+        self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_outbox_pending
+            ON notification_outbox(available_at, event_id)
+            WHERE delivered_at IS NULL
+            """)
+
         self.db.commit()
 
     def _recover_interrupted_jobs(self):
@@ -147,32 +176,31 @@ class Journal:
             WHERE status IN ('running', 'validating')
             """).fetchall()
 
-        for torrent_hash, source, old_status in rows:
-            self.db.execute(
-                """
-                UPDATE jobs
-                SET status = 'interrupted',
-                    updated_at = ?,
-                    last_error = ?
-                WHERE torrent_hash = ?
-                  AND source = ?
-                """,
-                (
-                    now(),
-                    f"Interrupted during {old_status}",
+        with self.db:
+            for torrent_hash, source, old_status in rows:
+                self.db.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'interrupted',
+                        updated_at = ?,
+                        last_error = ?
+                    WHERE torrent_hash = ?
+                      AND source = ?
+                    """,
+                    (
+                        now(),
+                        f"Interrupted during {old_status}",
+                        torrent_hash,
+                        source,
+                    ),
+                )
+
+                self._insert_event(
                     torrent_hash,
                     source,
-                ),
-            )
-
-            self._insert_event(
-                torrent_hash,
-                source,
-                "interrupted",
-                f"Recovered from {old_status}",
-            )
-
-        self.db.commit()
+                    "interrupted",
+                    f"Recovered from {old_status}",
+                )
 
     def _insert_event(
         self,
@@ -180,8 +208,10 @@ class Journal:
         source,
         event,
         detail="",
+        *,
+        notify=True,
     ):
-        self.db.execute(
+        cursor = self.db.execute(
             """
             INSERT INTO events (
                 at,
@@ -201,6 +231,21 @@ class Journal:
             ),
         )
 
+        event_id = cursor.lastrowid
+        if notify and event in NOTIFICATION_EVENTS:
+            message = f"Torrent: {torrent_hash or '-'}\nSource: {source or '-'}"
+            if detail:
+                message += f"\n{detail}"
+            self.db.execute(
+                """
+                INSERT INTO notification_outbox
+                    (event_id, event, message, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (event_id, event, message, now()),
+            )
+        return event_id
+
     def event(
         self,
         torrent_hash,
@@ -208,13 +253,13 @@ class Journal:
         event,
         detail="",
     ):
-        self._insert_event(
-            torrent_hash,
-            source,
-            event,
-            detail,
-        )
-        self.db.commit()
+        with self.db:
+            self._insert_event(
+                torrent_hash,
+                source,
+                event,
+                detail,
+            )
 
     def put(
         self,
@@ -233,7 +278,7 @@ class Journal:
 
         previous = self.db.execute(
             """
-            SELECT status, attempts
+            SELECT status, attempts, reason
             FROM jobs
             WHERE torrent_hash = ?
               AND source = ?
@@ -256,77 +301,78 @@ class Journal:
             json.dumps(metadata, ensure_ascii=False) if metadata is not None else None
         )
 
-        self.db.execute(
-            """
-            INSERT INTO jobs (
-                torrent_hash,
-                source,
-                status,
-                action,
-                reason,
-                output,
-                updated_at,
-                created_at,
-                started_at,
-                completed_at,
-                attempts,
-                last_error,
-                metadata
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-
-            ON CONFLICT(torrent_hash, source)
-            DO UPDATE SET
-                status = excluded.status,
-                action = excluded.action,
-                reason = excluded.reason,
-                output = excluded.output,
-                updated_at = excluded.updated_at,
-                started_at = COALESCE(
-                    excluded.started_at,
-                    jobs.started_at
-                ),
-                completed_at = COALESCE(
-                    excluded.completed_at,
-                    jobs.completed_at
-                ),
-                attempts = excluded.attempts,
-                last_error = excluded.last_error,
-                metadata = COALESCE(
-                    excluded.metadata,
-                    jobs.metadata
+        with self.db:
+            self.db.execute(
+                """
+                INSERT INTO jobs (
+                    torrent_hash,
+                    source,
+                    status,
+                    action,
+                    reason,
+                    output,
+                    updated_at,
+                    created_at,
+                    started_at,
+                    completed_at,
+                    attempts,
+                    last_error,
+                    metadata
                 )
-            WHERE jobs.status NOT IN ('quarantined', 'purging', 'purged')
-            """,
-            (
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+                ON CONFLICT(torrent_hash, source)
+                DO UPDATE SET
+                    status = excluded.status,
+                    action = excluded.action,
+                    reason = excluded.reason,
+                    output = excluded.output,
+                    updated_at = excluded.updated_at,
+                    started_at = COALESCE(
+                        excluded.started_at,
+                        jobs.started_at
+                    ),
+                    completed_at = COALESCE(
+                        excluded.completed_at,
+                        jobs.completed_at
+                    ),
+                    attempts = excluded.attempts,
+                    last_error = excluded.last_error,
+                    metadata = COALESCE(
+                        excluded.metadata,
+                        jobs.metadata
+                    )
+                WHERE jobs.status NOT IN ('quarantined', 'purging', 'purged')
+                """,
+                (
+                    torrent_hash,
+                    source,
+                    status,
+                    action,
+                    reason,
+                    output,
+                    timestamp,
+                    timestamp,
+                    timestamp if status == "running" else None,
+                    timestamp if status == "done" else None,
+                    attempts,
+                    reason if status == "failed" else None,
+                    metadata_json,
+                ),
+            )
+
+            if self.db.execute("SELECT changes()").fetchone()[0] != 1:
+                self.db.rollback()
+                raise RuntimeError("Job state changed during update; protected state preserved")
+
+            self._insert_event(
                 torrent_hash,
                 source,
                 status,
-                action,
                 reason,
-                output,
-                timestamp,
-                timestamp,
-                timestamp if status == "running" else None,
-                timestamp if status == "done" else None,
-                attempts,
-                reason if status == "failed" else None,
-                metadata_json,
-            ),
-        )
+                notify=previous is None or (previous[0], previous[2]) != (status, reason),
+            )
 
-        if self.db.execute("SELECT changes()").fetchone()[0] != 1:
-            self.db.rollback()
-            raise RuntimeError("Job state changed during update; protected state preserved")
-
-        self._insert_event(
-            torrent_hash,
-            source,
-            status,
-            reason,
-        )
-
-        self.db.commit()
 
     def status(self, torrent_hash, source):
         row = self.db.execute(
@@ -453,6 +499,66 @@ class Journal:
                 "fingerprinted",
                 f"size={size} sha256={digest}",
             )
+
+    def claim_notification(self, *, timestamp=None, lease_seconds=300):
+        """Claim one due message, committing before network I/O.
+
+        An expired claim is retried after a crash. Delivery is at-least-once:
+        a crash after Telegram accepts a message can cause a duplicate.
+        Call only outside an existing journal transaction.
+        """
+        if lease_seconds <= 0:
+            raise ValueError("Notification lease must be positive")
+        if self.db.in_transaction:
+            raise RuntimeError("Cannot claim inside a journal transaction")
+        timestamp = time.time() if timestamp is None else timestamp
+        token = uuid.uuid4().hex
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            cursor = self.db.execute(
+                """
+                SELECT event_id, event, message, attempts
+                FROM notification_outbox
+                WHERE delivered_at IS NULL AND available_at <= ?
+                ORDER BY available_at, event_id LIMIT 1
+                """,
+                (timestamp,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            self.db.execute(
+                """
+                UPDATE notification_outbox
+                SET claim_token = ?, available_at = ?, attempts = attempts + 1
+                WHERE event_id = ?
+                """,
+                (token, timestamp + lease_seconds, row[0]),
+            )
+        return dict(event_id=row[0], event=row[1], message=row[2],
+                    attempts=row[3] + 1, claim_token=token)
+
+    def finish_notification(self, event_id, claim_token, *, delivered,
+                            retry_at=0):
+        """Acknowledge only the current claim; retain failures for later retry.
+
+        Store a fixed error label rather than remote responses or credentials.
+        """
+        if self.db.in_transaction:
+            raise RuntimeError("Cannot finish inside a journal transaction")
+        with self.db:
+            cursor = self.db.execute(
+                """
+                UPDATE notification_outbox
+                SET delivered_at = ?, available_at = ?, claim_token = NULL,
+                    last_error = ?
+                WHERE event_id = ? AND claim_token = ?
+                  AND delivered_at IS NULL
+                """,
+                (now() if delivered else None, retry_at,
+                 None if delivered else "delivery_failed", event_id, claim_token),
+            )
+        return cursor.rowcount == 1
 
     def close(self):
         self.db.close()

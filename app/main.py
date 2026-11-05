@@ -8,6 +8,7 @@ import time
 import yaml
 from .compat import VIDEO_EXTS, decision
 from .journal import Journal
+from .notifier import NotificationDispatcher, TelegramNotifier, TelegramSettings
 from .qbit import Qbit
 from .publisher import finalize_torrent
 from .safe_move import move_no_replace
@@ -306,26 +307,35 @@ def main():
         cfg = yaml.safe_load(f)
     Path(cfg["state_db"]).parent.mkdir(parents=True, exist_ok=True)
     journal = Journal(cfg["state_db"])
+    telegram_settings = TelegramSettings.from_environment()
+    dispatcher = NotificationDispatcher(
+        journal, TelegramNotifier(telegram_settings) if telegram_settings else None,
+    )
     log.info(
         "media-agent v0.1 started process_enabled=%s finalize_enabled=%s",
         cfg["process_enabled"],
         cfg["finalize_enabled"],
     )
-    while True:
-        try:
-            q = Qbit(
-                os.environ["QBIT_URL"],
-                os.environ["QBIT_USERNAME"],
-                os.environ["QBIT_PASSWORD"],
-            )
-            for torrent in q.completed():
-                try:
-                    process_torrent(q, torrent, cfg, journal)
-                except Exception:
-                    log.exception("Torrent processing error: %s", torrent.get("hash"))
-        except Exception:
-            log.exception("Polling error")
-        time.sleep(cfg["poll_seconds"])
+    try:
+        while True:
+            try:
+                q = Qbit(
+                    os.environ["QBIT_URL"],
+                    os.environ["QBIT_USERNAME"],
+                    os.environ["QBIT_PASSWORD"],
+                )
+                for torrent in q.completed():
+                    try:
+                        process_torrent(q, torrent, cfg, journal)
+                    except Exception:
+                        log.exception("Torrent processing error: %s", torrent.get("hash"))
+            except Exception:
+                log.exception("Polling error")
+            # Retry notifications even when qBittorrent polling fails.
+            dispatcher.dispatch()
+            time.sleep(cfg["poll_seconds"])
+    finally:
+        journal.close()
 
 
 if __name__ == "__main__":

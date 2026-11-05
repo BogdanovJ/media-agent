@@ -1,8 +1,8 @@
 """Best-effort Telegram notifications for media-agent.
 
 No file-processing code should depend on successful delivery. This module does
-not claim exactly-once delivery; durable event deduplication will be implemented
-at the journal/integration layer.
+not claim exactly-once delivery. The journal outbox persists pending messages
+and delivery attempts across restarts.
 """
 
 from __future__ import annotations
@@ -94,3 +94,53 @@ class TelegramNotifier:
                     return False
             self._sleep(min(2 ** (attempt - 1), 4))
         return False
+
+
+class NotificationDispatcher:
+    """Drain a bounded batch, keeping all network calls outside transactions.
+
+    No notifier means credentials are disabled: leave pending rows untouched.
+    A delivery failure never changes the media job's status.
+    """
+
+    def __init__(self, journal, notifier, *, clock=None):
+        self.journal = journal
+        self.notifier = notifier
+        self.clock = clock or time.time
+
+    def dispatch(self, *, limit=10):
+        if self.notifier is None:
+            return 0
+        delivered_count = 0
+        for _ in range(limit):
+            try:
+                # Cover the configured HTTP timeouts and internal retry sleeps.
+                settings = self.notifier.settings
+                lease_seconds = max(
+                    300, settings.attempts * (settings.timeout_seconds + 4) + 60,
+                )
+                item = self.journal.claim_notification(
+                    timestamp=self.clock(), lease_seconds=lease_seconds,
+                )
+                if item is None:
+                    break
+                try:
+                    delivered = self.notifier.send(item["event"], item["message"]) is True
+                except Exception:
+                    # An injected transport can raise unexpected exceptions.
+                    # Do not log arbitrary exception text containing credentials.
+                    log.warning("Telegram delivery raised event_id=%s", item["event_id"])
+                    delivered = False
+                delay = min(60 * 2 ** min(item["attempts"] - 1, 6), 3600)
+                acknowledged = self.journal.finish_notification(
+                    item["event_id"], item["claim_token"], delivered=delivered,
+                    retry_at=self.clock() + delay,
+                )
+                if acknowledged and delivered:
+                    delivered_count += 1
+            except Exception:
+                # Leave unacknowledged claims to expire, including when SQLite
+                # is unavailable after Telegram accepted the message.
+                log.warning("Notification outbox unavailable; delivery deferred")
+                break
+        return delivered_count
