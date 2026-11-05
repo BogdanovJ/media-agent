@@ -21,7 +21,7 @@ GitOps repository: `/Users/jay/Projects/homeLab`.
 Within `homeLab`:
 
 - `apps/media-agent/configmap.yaml`: pod settings, seven-day retention, retirement hash approvals, metrics on port 9108. Pod media paths start with `/downloads`; the host volume is `/mnt/downloads`.
-- `apps/media-agent/deployment.yaml`: proposed writable media mount, one replica with `Recreate`, credentials references, and planned ARM64 image tag `outbox-metrics-20261105-1`.
+- `apps/media-agent/deployment.yaml`: proposed writable media mount, one replica with `Recreate`, credentials references, and planned ARM64 image tag `outbox-metrics-20261105-2`.
 - `apps/media-agent/secret.enc.yaml`: SOPS-encrypted Secret `media-agent-qbit`, keys `username` and `password`. Deployment supplies `QBIT_URL` separately.
 - `apps/media-agent/ghcr-pull.enc.yaml`: encrypted Docker pull Secret `ghcr-pull`. This does **not** sign your Mac into Docker for pushing images.
 - `apps/media-agent/example.telegram.enc.yaml`: encrypted placeholder template; excluded from deployment.
@@ -98,7 +98,7 @@ After review, commit the application changes, then build/push the **ARM64** imag
 ```bash
 cd /Users/jay/Projects/media-agent
 docker buildx build --platform linux/arm64 \
-  -t ghcr.io/bogdanovj/media-agent:outbox-metrics-20261105-1 --push .
+  -t ghcr.io/bogdanovj/media-agent:outbox-metrics-20261105-2 --push .
 ```
 
 Before the GitOps commit/push:

@@ -17,7 +17,9 @@ COPY app/ ./app/
 COPY config/ ./config/
 
 # Install application dependencies
-RUN pip install --no-cache-dir .
+# COPY preserves local file modes; the pod runs as UID 1000.
+RUN chmod -R a+rX app config pyproject.toml \
+    && pip install --no-cache-dir .
 
 # Persistent journal directory
 RUN mkdir -p /var/lib/media-agent
