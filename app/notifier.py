@@ -125,7 +125,11 @@ class NotificationDispatcher:
                 if item is None:
                     break
                 try:
-                    delivered = self.notifier.send(item["event"], item["message"]) is True
+                    notice = f"Event #{item['event_id']} | delivery attempt {item['attempts']}\n"
+                    if item['attempts'] > 1:
+                        notice += ("RETRY — possible duplicate. An earlier delivery may have succeeded "
+                                   "without confirmation; the same event ID is not a new media action.\n")
+                    delivered = self.notifier.send(item["event"], notice + item["message"]) is True
                 except Exception:
                     # An injected transport can raise unexpected exceptions.
                     # Do not log arbitrary exception text containing credentials.

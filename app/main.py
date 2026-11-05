@@ -9,6 +9,8 @@ import yaml
 from .compat import VIDEO_EXTS, decision
 from .journal import Journal
 from .notifier import NotificationDispatcher, TelegramNotifier, TelegramSettings
+from .metrics import MetricsState, start_metrics
+from .cleanup import cleanup_expired
 from .qbit import Qbit
 from .publisher import finalize_torrent
 from .safe_move import move_no_replace
@@ -316,6 +318,8 @@ def main():
         cfg["process_enabled"],
         cfg["finalize_enabled"],
     )
+    metrics_state = MetricsState()
+    metrics_server = start_metrics(cfg["state_db"], cfg, metrics_state)
     try:
         while True:
             try:
@@ -329,12 +333,21 @@ def main():
                         process_torrent(q, torrent, cfg, journal)
                     except Exception:
                         log.exception("Torrent processing error: %s", torrent.get("hash"))
+                metrics_state.poll_finished(True)
             except Exception:
+                metrics_state.poll_finished(False)
                 log.exception("Polling error")
+            try:
+                cleanup_expired(cfg, journal)
+            except Exception:
+                log.exception("Cleanup scan failed")
             # Retry notifications even when qBittorrent polling fails.
             dispatcher.dispatch()
             time.sleep(cfg["poll_seconds"])
     finally:
+        if metrics_server is not None:
+            metrics_server.shutdown()
+            metrics_server.server_close()
         journal.close()
 
 
