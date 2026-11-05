@@ -9,6 +9,7 @@ import yaml
 from .compat import VIDEO_EXTS, decision
 from .journal import Journal
 from .qbit import Qbit
+from .publisher import finalize_torrent
 from .safe_move import move_no_replace
 
 logging.basicConfig(
@@ -227,6 +228,9 @@ def process_torrent(q, t, cfg, journal):
         if candidate.is_symlink():
             raise ValueError(f"Refusing symlink source: {candidate}")
         src = candidate.resolve()
+        # Ignore macOS AppleDouble metadata files (e.g. ._Movie.mkv).
+        if src.name.startswith("._") or src.name == ".DS_Store":
+            continue
         if src.suffix.lower() not in VIDEO_EXTS:
             continue
         if (
@@ -235,10 +239,12 @@ def process_torrent(q, t, cfg, journal):
             or within(src, quarantine_root)
         ):
             raise ValueError(f"Unsafe source path: {src}")
+        existing_status = journal.status(h, str(src))
+        # Do not regress protected journal states after originals are moved.
+        if existing_status in ("done", "review", "quarantined", "purging", "purged"):
+            continue
         if not src.is_file():
             journal.put(h, str(src), "missing", reason="Source not found")
-            continue
-        if journal.status(h, str(src)) in ("done", "review"):
             continue
         metadata = probe(src)
         action, reason = decision(
@@ -274,9 +280,22 @@ def process_torrent(q, t, cfg, journal):
         except Exception as e:
             log.exception("Conversion failed: %s", src)
             journal.put(h, str(src), "failed", action, str(e))
-    # Original files are intentionally kept untouched after publishing.
-    # Removal/quarantine requires a separate, journalled transaction; do not
-    # enable it until an entire multi-file torrent has been validated.
+    # A completed torrent is NOT automatically eligible for retirement.
+    # Only per-hash operator approvals permit the coordinator to run.
+    allowed = cfg.get("retirement_allow_hashes", [])
+    if not isinstance(allowed, list):
+        raise ValueError("retirement_allow_hashes must be a list")
+    approved = h.lower() in {str(value).lower() for value in allowed}
+    if cfg.get("finalize_enabled", False) and approved:
+        if not cfg.get("process_enabled", False):
+            raise PermissionError("Cannot finalize with processing disabled")
+        log.info("Retirement explicitly approved for hash=%s", h)
+        finalize_torrent(
+            q, t, journal, root, quarantine_root,
+            finalize_enabled=True,
+            allow_torrent_retirement=True,
+            retention_days=cfg.get("cleanup_days", 7),
+        )
 
 
 def main():
