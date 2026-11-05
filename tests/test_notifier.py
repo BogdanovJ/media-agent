@@ -115,3 +115,14 @@ def test_invalid_configuration_rejected():
         TelegramNotifier(TelegramSettings("token", "chat", attempts=0))
     with pytest.raises(ValueError):
         TelegramNotifier(TelegramSettings("token", "chat", timeout_seconds=0))
+
+
+@pytest.mark.parametrize("payload", [None, [], ["ok"], "hello", 42, True])
+def test_malformed_json_shapes_fail_closed(payload):
+    calls = []
+    def opener(req, timeout):
+        calls.append(1)
+        return FakeResponse(payload)
+    notifier = TelegramNotifier(settings(), opener=opener, sleep=lambda _s: None)
+    assert notifier.send("Completed", "A.mp4") is False
+    assert len(calls) == 1

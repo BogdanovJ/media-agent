@@ -68,10 +68,19 @@ class TelegramNotifier:
             try:
                 with self._open(request, timeout=self.settings.timeout_seconds) as response:
                     payload = json.load(response)
+                # Telegram should return a JSON object. A valid JSON list,
+                # string or null is still an invalid API response.
+                if not isinstance(payload, dict):
+                    log.warning(
+                        "Telegram malformed API response event=%s attempt=%d",
+                        event,
+                        attempt,
+                    )
+                    return False
                 if payload.get("ok") is True:
                     log.info("Telegram delivered event=%s", event)
                     return True
-                # Telegram JSON errors may contain sensitive response data; do not log it.
+                # Never log arbitrary remote response fields or the request URL.
                 log.warning("Telegram API declined event=%s attempt=%d", event, attempt)
                 return False
             except HTTPError as exc:
