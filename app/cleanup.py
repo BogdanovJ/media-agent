@@ -22,6 +22,9 @@ def cleanup_expired(cfg, journal):
             "SELECT 1 FROM events WHERE torrent_hash=? AND event='torrent_retired' LIMIT 1",
             (torrent_hash,),
         ).fetchone()
+        lifecycle = journal.db.execute("SELECT state FROM retirements WHERE torrent_hash=?", (torrent_hash,)).fetchone()
+        if lifecycle and lifecycle[0] != "completed":
+            continue
         if not retired:
             continue
         try:
@@ -31,7 +34,7 @@ def cleanup_expired(cfg, journal):
             quarantine = Path(cfg['quarantine_root']).resolve()
             if (not output.is_absolute() or output.is_symlink()
                     or not output.is_file() or output.stat().st_size == 0
-                    or output.resolve() == Path(source).resolve()
+                    or (output.resolve() == Path(source).resolve() and not lifecycle)
                     or output.resolve().parent != Path(source).resolve().parent
                     or not is_within(output.resolve(), root)
                     or output.resolve() == quarantine or is_within(output.resolve(), quarantine)):

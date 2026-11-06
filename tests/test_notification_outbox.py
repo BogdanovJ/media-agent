@@ -291,7 +291,7 @@ def test_observation_processing_never_converts_or_retires(journal, tmp_path, mon
     monkeypatch.setattr(app_main, 'decision', lambda *args: (action, 'test reason'))
     convert = Mock(side_effect=AssertionError('conversion must remain disabled'))
     retire = Mock(side_effect=AssertionError('retirement must remain disabled'))
-    monkeypatch.setattr(app_main, 'convert', convert)
+    monkeypatch.setattr(app_main.worker, 'convert', convert)
     monkeypatch.setattr(app_main, 'finalize_torrent', retire)
     app_main.process_torrent(qbit, dict(hash='hash', save_path=str(downloads)), cfg, journal)
     assert journal.status('hash', str(source)) == expected_status

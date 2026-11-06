@@ -4,8 +4,9 @@ Listing finished torrents is read-only. Deleting a torrent record requires an
 explicit confirmation at the call site and never requests file deletion.
 """
 
+from pathlib import Path
 import re
-from urllib import response
+
 
 import requests
 
@@ -29,9 +30,14 @@ class Qbit:
     def __init__(self, url, username, password):
         self.url = url.rstrip("/")
         self.session = requests.Session()
+        self.credentials = {"username": username, "password": password}
+        self.login()
+
+    def login(self):
+        self.session.cookies.clear()
         response = self.session.post(
             self.url + "/api/v2/auth/login",
-            data={"username": username, "password": password},
+            data=self.credentials, allow_redirects=False,
             timeout=15,
         )
         response.raise_for_status()
@@ -42,6 +48,45 @@ class Qbit:
         ):
             raise RuntimeError(f"qBittorrent login failed: HTTP {response.status_code}")
 
+    def request(self, method, url, **kwargs):
+        for attempt in range(2):
+            response = self.session.request(method, url, allow_redirects=False, **kwargs)
+            if response.status_code == 403 and attempt == 0:
+                self.login()
+                if method != "GET":
+                    response.raise_for_status()  # Reconcile before any new removal attempt.
+                continue
+            response.raise_for_status()
+            if response.status_code != 200:
+                raise RuntimeError("Unexpected qBittorrent response")
+            return response
+
+    def check_shared_paths(self, torrent_hash, paths):
+        # A different torrent, including one still downloading, may share media.
+        rows = self.request("GET", self.url + "/api/v2/torrents/info", timeout=30).json()
+        if not isinstance(rows, list):
+            raise ValueError("Invalid torrent inventory")
+        for row in rows:
+            if row["hash"].lower() == torrent_hash.lower():
+                continue
+            base = Path(row["save_path"])
+            if not base.is_absolute():
+                raise ValueError("Invalid torrent save path")
+            if not any(path.is_relative_to(base) for path in paths):
+                continue
+            if any((base / entry["name"]).resolve() in paths for entry in self.files(row["hash"])):
+                raise ValueError("Another torrent references a file in this retirement")
+
+    def lookup(self, torrent_hash):
+        self._check_hash(torrent_hash)
+        rows = self.request("GET", self.url + "/api/v2/torrents/info",
+                            params={"hashes": torrent_hash}, timeout=30).json()
+        if rows == []:
+            return None
+        if not isinstance(rows, list) or len(rows) != 1 or rows[0]["hash"].lower() != torrent_hash.lower():
+            raise RuntimeError("Unexpected qBittorrent hash lookup")
+        return rows[0]
+
     def completed(self):
         """Return completed, stable torrents for inspection.
 
@@ -49,7 +94,7 @@ class Qbit:
         a periodically updated torrent cannot be identified reliably from its
         completion state alone; that policy belongs in the processing layer.
         """
-        response = self.session.get(
+        response = self.request("GET",
             self.url + "/api/v2/torrents/info",
             params={"filter": "completed"},
             timeout=30,
@@ -69,7 +114,7 @@ class Qbit:
 
     def files(self, torrent_hash):
         self._check_hash(torrent_hash)
-        response = self.session.get(
+        response = self.request("GET",
             self.url + "/api/v2/torrents/files",
             params={"hash": torrent_hash},
             timeout=30,
@@ -97,7 +142,7 @@ class Qbit:
         self._check_hash(torrent_hash)
         if not confirmed:
             raise PermissionError("Torrent removal requires explicit confirmation")
-        response = self.session.post(
+        response = self.request("POST",
             self.url + "/api/v2/torrents/delete",
             data={"hashes": torrent_hash, "deleteFiles": "false"},
             timeout=30,

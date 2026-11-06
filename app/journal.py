@@ -10,6 +10,8 @@ JOB_STATUSES = {
     "planned",
     "running",
     "validating",
+    "validated",
+    "queued",
     "done",
     "review",
     "blocked",
@@ -160,6 +162,12 @@ class Journal:
             WHERE delivered_at IS NULL
             """)
 
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS retirements (
+                torrent_hash TEXT PRIMARY KEY, save_path TEXT NOT NULL,
+                sources TEXT NOT NULL, state TEXT NOT NULL
+            )
+        """)
         self.db.commit()
 
     def _recover_interrupted_jobs(self):

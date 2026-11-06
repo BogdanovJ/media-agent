@@ -1,18 +1,29 @@
-# Media Agent: rollout quick read
+# Media Agent
 
-**Release guide: processing enabled; updated season-pack retirement remains explicitly approved.**
+The controller discovers completed, stable qBittorrent downloads. It probes selected videos,
+ignores AppleDouble files, and queues one assignment per source. New conversions stay under
+`.media-agent/<hash>/<source-key>/` on the downloads filesystem. Workers decode the entire
+MP4 and verify its container, video, stereo audio and duration. Compatible originals and
+journal-linked legacy outputs receive the same validation without reconversion.
 
-## What will happen
+The controller persists the selected file list and validated fingerprints before requesting
+record-only retirement. An authenticated exact-hash lookup must confirm absence. The controller
+then archives each converted original under the configured quarantine directory, promotes the
+verified output using the original basename (preserving MP4 extension case), and marks the
+torrent complete. Each move refuses to overwrite and can be reconciled after a restart.
+Seven days after archival, cleanup verifies both the archived and published file identities.
+Conflicts, incomplete selections, shared files and API failures block finalization.
 
-- Poll fully completed, stable qBittorrent torrents; remux/transcode when required.
-- Keep verified MP4 outputs beside the original files until **you remove them manually**. MP4 inputs needing conversion produce `<stem>.media-agent.mp4`; other containers produce `<stem>.mp4`. Existing outputs are never overwritten.
-- The worker rechecks historical MP4 jobs incorrectly marked done with remux/transcode action and the original path as output. It records a correction and preserves the original; genuinely completed conversions and compatible originals are not reprocessed.
-- Already-compatible files stay in place: they are the playable copy, not disposable originals.
-- Processing, finalization, and cleanup switches are enabled in the proposed configuration.
-- **Your TorrentMonitor updates season packs. Keep those hashes out of `retirement_allow_hashes`.** Moving their originals or removing their qBittorrent entries can interfere with future updates.
-- Retirement remains limited to explicitly approved, finished torrent hashes. Both proposed allowlists are empty, so no torrents will be retired by this rollout until you approve them.
-- Once an approved torrent is fully processed, originals move to quarantine; its qBittorrent record is removed with `deleteFiles=false`. After seven days, cleanup deletes only fingerprint-verified quarantined originals with a recorded successful retirement and an existing playable output.
-- Incomplete packs are not processed episode by episode. Replacing a pack may produce a new torrent hash; existing output collisions go to manual review rather than overwriting your media. Automatic lifecycle support for evolving packs still needs a TorrentMonitor policy/integration.
+Set `retire_all_completed: true` to retire all eligible torrents. Otherwise use
+`retirement_allow_hashes` for individual approvals. Re-added or revised packs must pass the
+same checks. A completed hash is never replayed automatically.
+
+With `worker_jobs: true`, the singleton controller owns the existing journal PVC and submits
+named Kubernetes Jobs. The namespace quota admits at most two Jobs. Each worker has a two-CPU
+limit, read-only downloads, write access to only its assignment directory, and no journal,
+qBittorrent credentials or service account token. Finished Jobs expire after 60 seconds.
+The worker image follows the controller’s pinned image. Without the Job setting, the same
+validation and staging logic runs locally.
 
 ## Files and credentials
 
@@ -22,7 +33,7 @@ GitOps repository: `/Users/jay/Projects/homeLab`.
 Within `homeLab`:
 
 - `apps/media-agent/configmap.yaml`: pod settings, seven-day retention, retirement hash approvals, metrics on port 9108. Pod media paths start with `/downloads`; the host volume is `/mnt/downloads`.
-- `apps/media-agent/deployment.yaml`: proposed writable media mount, one replica with `Recreate`, credentials references, and planned ARM64 image tag `outbox-metrics-20261105-2`.
+- `apps/media-agent/deployment.yaml`: proposed writable media mount, one replica with `Recreate`, credentials references, and digest-pinned ARM64 image.
 - `apps/media-agent/secret.enc.yaml`: SOPS-encrypted Secret `media-agent-qbit`, keys `username` and `password`. Deployment supplies `QBIT_URL` separately.
 - `apps/media-agent/ghcr-pull.enc.yaml`: encrypted Docker pull Secret `ghcr-pull`. This does **not** sign your Mac into Docker for pushing images.
 - `apps/media-agent/example.telegram.enc.yaml`: encrypted placeholder template; excluded from deployment.
@@ -81,7 +92,7 @@ Grafana shows pending, delivered, and retried messages, pending age, job states,
 
 ## Release procedure
 
-First review both repositories, the retirement list, and credentials. Keep active season packs unapproved. Back up the journal with SQLite's online backup facility or while the pod is stopped; copying only a live WAL database file is not a reliable backup.
+First review both repositories, the retirement list, and credentials. Check the configured retirement policy. Back up the journal with SQLite's online backup facility or while the pod is stopped; copying only a live WAL database file is not a reliable backup.
 
 Application validation:
 
@@ -99,7 +110,7 @@ After review, commit the application changes, then build/push the **ARM64** imag
 ```bash
 cd /Users/jay/Projects/media-agent
 docker buildx build --platform linux/arm64 \
-  -t ghcr.io/bogdanovj/media-agent:outbox-metrics-20261105-2 --push .
+  -t ghcr.io/bogdanovj/media-agent:lifecycle-$(git rev-parse --short HEAD) --push .
 ```
 
 Before the GitOps commit/push:

@@ -1,5 +1,5 @@
 from pathlib import Path
-from types import SimpleNamespace
+from app.quarantine import fingerprint
 
 import pytest
 
@@ -26,15 +26,14 @@ def fixture(tmp_path):
     output.write_bytes(b"verified")
     torrent = {"hash": H, "save_path": str(root)}
     entries = [{"name": "Series/Season 1/Episode.mkv", "priority": 1}]
-    journal = StubJournal({(H, str(source)): {"status": "done", "output": str(output)}})
+    journal = StubJournal({(H, str(source)): {"source": str(source), "status": "validated", "action": "remux", "output": str(output), "metadata": {"original": list(fingerprint(source)), "verified": list(fingerprint(output))}}})
     return root, source, output, torrent, entries, journal
 
 
 def test_plans_original_folder(tmp_path):
     root, source, output, torrent, entries, journal = fixture(tmp_path)
     plan = plan_retirement(torrent, entries, journal, root, root / "deleted")
-    assert plan.originals == (source,)
-    assert plan.unchanged == ()
+    assert plan == [str(source)]
     assert source.exists() and output.exists()
 
 
@@ -49,16 +48,15 @@ def test_rejects_unfinished_episode_before_moving_anything(tmp_path):
 def test_original_remains_for_compatible_mp4(tmp_path):
     root, source, output, torrent, entries, journal = fixture(tmp_path)
     entries = [{"name": "Series/Season 1/Episode.mp4", "priority": 1}]
-    journal.jobs[(H, str(output))] = {"status": "done", "output": str(output)}
+    journal.jobs[(H, str(output))] = {"source": str(output), "status": "validated", "action": "copy", "output": str(output), "metadata": {"original": list(fingerprint(output)), "verified": list(fingerprint(output))}}
     plan = plan_retirement(torrent, entries, journal, root, root / "deleted")
-    assert plan.originals == ()
-    assert plan.unchanged == (output,)
+    assert plan == [str(output)]
 
 
 def test_rejects_other_folder_output(tmp_path):
     root, source, output, torrent, entries, journal = fixture(tmp_path)
-    journal.jobs[(H, str(source))] = {"status": "done", "output": str(root / "unrelated.mp4")}
-    with pytest.raises(ValueError, match="Output must remain"):
+    journal.jobs[(H, str(source))]["output"] = str(root / "unrelated.mp4")
+    with pytest.raises(ValueError, match="Unexpected validated output"):
         plan_retirement(torrent, entries, journal, root, root / "deleted")
 
 

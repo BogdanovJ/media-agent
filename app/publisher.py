@@ -1,119 +1,142 @@
-"""Preflight and coordinated retirement for an entirely processed torrent.
-
-The conversion worker publishes the verified MP4 in its original directory.
-This module evaluates whether the *whole torrent* can safely be retired.
-No operations occur unless ``finalize_enabled`` is explicitly true.
-
-A torrent can be revised by a publisher after completion; such torrents must
-be excluded by policy before calling finalize_torrent.
-"""
-
-from dataclasses import dataclass
+"""Controller-only, replayable record removal, archival and publication."""
+import json
+import os
+from datetime import timedelta
 from pathlib import Path
 
-from .compat import VIDEO_EXTS
-from .quarantine import Quarantine, is_within
+from .paths import checked, final_path, legacy_path, sources, work_dir
+from .qbit import READY_STATES
+from .quarantine import Quarantine, fingerprint, utcnow
+from .safe_move import move_no_replace
 
 
-@dataclass(frozen=True)
-class RetirementPlan:
-    torrent_hash: str
-    originals: tuple[Path, ...]
-    unchanged: tuple[Path, ...]
-    ignored: tuple[Path, ...]
+def verify(path, identity):
+    if list(fingerprint(path)) != identity:
+        raise ValueError(f"File differs from validated contents: {path}")
 
 
-def plan_retirement(torrent, entries, journal, download_root, quarantine_root):
-    """Validate every selected torrent file before any file is moved.
-
-    Non-video files are never moved; they may still belong to the torrent.
-    This prevents a partially processed multi-episode torrent being retired.
-    """
-    torrent_hash = torrent["hash"]
-    root = Path(download_root).resolve()
-    quarantine_root = Path(quarantine_root).resolve()
-    base = Path(torrent["save_path"]).resolve()
-    if base != root and not is_within(base, root):
-        raise ValueError(f"Torrent save path outside download root: {base}")
-
-    if not entries:
-        raise ValueError("Torrent has no file entries")
-
-    originals, unchanged, ignored = [], [], []
-    for entry in entries:
-        if entry.get("priority") == 0:
-            continue
-        name = entry["name"]
-        candidate = base / name
-        if candidate.is_symlink():
-            raise ValueError(f"Symlink source: {candidate}")
-        source = candidate.resolve()
-        if not is_within(source, root) or source == quarantine_root or is_within(source, quarantine_root):
-            raise ValueError(f"Unsafe source path: {source}")
-
-        if source.name.startswith("._") or source.name == ".DS_Store":
-            ignored.append(source)
-            continue
-        if source.suffix.lower() not in VIDEO_EXTS:
-            ignored.append(source)
-            continue
-
-        job = journal.get(torrent_hash, str(source))
-        if not job or job["status"] not in ("done", "quarantined"):
-            raise ValueError(f"Incomplete media job: {source}")
-
-        output_name = job.get("output")
-        if not output_name:
-            raise ValueError(f"Missing output record: {source}")
-        output = Path(output_name).resolve()
-        if not is_within(output, root) or output == quarantine_root or is_within(output, quarantine_root):
-            raise ValueError(f"Unsafe output path: {output}")
-        if output.parent != source.parent:
-            raise ValueError(f"Output must remain alongside source: {source}")
-        if not output.is_file() or output.stat().st_size == 0:
-            raise ValueError(f"Missing or empty verified output: {output}")
-
-        if output == source:
-            if job["status"] != "done":
-                raise ValueError(f"Untouched file cannot be quarantined: {source}")
-            unchanged.append(source)
-        else:
-            if job["status"] == "done" and not source.is_file():
-                raise ValueError(f"Original missing before quarantine: {source}")
-            originals.append(source)
-
-    if not originals and not unchanged:
-        raise ValueError("No eligible video files")
-    return RetirementPlan(torrent_hash, tuple(originals), tuple(unchanged), tuple(ignored))
+def paths(job, h, root, quarantine):
+    src = checked(job["source"], root)
+    final = checked(final_path(src), root)
+    output = checked(job["output"], root)
+    archive = checked(quarantine.destination(h, src), root)
+    if quarantine.quarantine_root in src.parents or root / ".media-agent" in src.parents:
+        raise ValueError(f"Internal source path: {src}")
+    if job["action"] == "copy":
+        if output != src:
+            raise ValueError("Unexpected unchanged file")
+    elif output not in (work_dir(root, h, src) / "output.mp4", legacy_path(src), final):
+        raise ValueError("Unexpected validated output")
+    return src, output, final, archive
 
 
-def finalize_torrent(qbit, torrent, journal, download_root, quarantine_root,
-                     *, finalize_enabled=False, allow_torrent_retirement=False,
-                     retention_days=7):
-    """Retire a fully processed, explicitly eligible torrent.
+def plan_retirement(torrent, entries, journal, root, archive):
+    root = Path(root).resolve()
+    h = torrent["hash"]
+    quarantine = Quarantine(root, archive, journal)
+    selected = sources(torrent, entries, root, quarantine.quarantine_root)
+    destinations = set()
+    if not selected:
+        raise ValueError("No eligible media")
+    for src in selected:
+        job = journal.get(h, str(src))
+        if not job or job["status"] != "validated":
+            raise ValueError(f"Incomplete media job: {src}")
+        _, output, final, target = paths(job, h, root, quarantine)
+        key = str(final).casefold()
+        if key in destinations or (output != src and output in selected):
+            raise ValueError(f"Torrent filename collision: {final}")
+        destinations.add(key)
+        if os.path.lexists(target) or (final not in (src, output) and os.path.lexists(final)):
+            raise FileExistsError(final)
+        verify(src, job["metadata"]["original"])
+        verify(output, job["metadata"]["verified"])
+    return [str(src) for src in selected]
 
-    Never invoke for frequently updated torrents. Quarantines verified originals
-    before removing the qBittorrent record with deleteFiles=false. A failure
-    leaves files intact in their current or quarantined locations for recovery.
-    """
+
+def finalize_torrent(qbit, torrent, journal, download_root, quarantine_root, *,
+                     finalize_enabled=False, allow_torrent_retirement=False):
     if not finalize_enabled:
         raise PermissionError("Finalization is disabled")
     if not allow_torrent_retirement:
         raise PermissionError("Torrent retirement requires an explicit policy opt-in")
+    root = Path(download_root).resolve()
+    h = torrent["hash"]
+    db = journal.db
+    row = db.execute("SELECT state,sources,save_path FROM retirements WHERE torrent_hash=?", (h,)).fetchone()
+    if row and row[0] == "completed":
+        return
+    if row:
+        state, manifest, save_path = row
+        selected = json.loads(manifest)
+        torrent = dict(hash=h, save_path=save_path)
+    else:
+        selected = plan_retirement(torrent, qbit.files(h), journal, root, quarantine_root)
+        state = "retirement_pending"
+        with db:
+            db.execute("INSERT INTO retirements VALUES (?,?,?,?)",
+                       (h, torrent["save_path"], json.dumps(selected), state))
+    live = qbit.lookup(h)
+    if state == "retirement_pending":
+        if live is not None:
+            if (live["save_path"] != torrent["save_path"] or live["state"] not in READY_STATES
+                    or live["progress"] != 1 or live["amount_left"] != 0):
+                raise ValueError("Torrent no longer ready for retirement")
+            if plan_retirement(live, qbit.files(h), journal, root, quarantine_root) != selected:
+                raise ValueError("Torrent file selection changed")
+            owned = {Path(name) for name in selected}
+            owned.update(final_path(Path(name)) for name in selected)
+            owned.update(Path(journal.get(h, name)["output"]) for name in selected)
+            qbit.check_shared_paths(h, owned)
+            qbit.remove_record_only(h, confirmed=True)
+            if qbit.lookup(h) is not None:
+                return
+        with db:
+            db.execute("UPDATE retirements SET state='torrent_retired' WHERE torrent_hash=?", (h,))
+            journal._insert_event(h, "", "torrent_retired", "Confirmed absent; payload retained")
+    elif live is not None:
+        raise ValueError("Retired torrent is present again")
 
-    entries = qbit.files(torrent["hash"])
-    plan = plan_retirement(torrent, entries, journal, download_root, quarantine_root)
-    quarantine = Quarantine(download_root, quarantine_root, journal, retention_days)
-    for source in plan.originals:
-        status = journal.status(plan.torrent_hash, str(source))
-        if status == "quarantined":
-            target = quarantine.destination(plan.torrent_hash, source)
-            if not target.is_file():
-                raise RuntimeError(f"Quarantine record exists, but file is missing: {target}")
-        else:
-            quarantine.move(plan.torrent_hash, source)
-
-    # Only reached once every selected video has been accounted for.
-    qbit.remove_record_only(plan.torrent_hash, confirmed=True)
-    journal.event(plan.torrent_hash, "", "torrent_retired", "Removed qBittorrent record; data retained")
-    return plan
+    quarantine = Quarantine(root, quarantine_root, journal)
+    for name in selected:
+        job = journal.get(h, name)
+        src, output, final, target = paths(job, h, root, quarantine)
+        meta = job["metadata"]
+        if job["action"] == "copy":
+            verify(src, meta["verified"])
+            continue
+        if job["status"] == "validated":
+            verify(output, meta["verified"])
+            if not target.exists():
+                verify(src, meta["original"])
+                target.parent.mkdir(parents=True, exist_ok=True)
+                move_no_replace(src, target)
+            elif src.exists():
+                raise ValueError(f"Archive collision: {src}")
+            verify(target, meta["original"])
+            at = utcnow()
+            with db:
+                db.execute("""UPDATE jobs SET status='quarantined', quarantined_at=?, purge_after=?,
+                              source_size=?, source_sha256=?, fingerprinted_at=?, updated_at=?
+                              WHERE torrent_hash=? AND source=?""",
+                           (at.isoformat(), (at + timedelta(days=7)).isoformat(), *meta["original"],
+                            at.isoformat(), at.isoformat(), h, name))
+                journal._insert_event(h, name, "quarantined", str(target))
+        if job["status"] not in ("quarantined", "validated"):
+            raise ValueError("Unexpected archive state")
+        verify(target, meta["original"])
+        if output != final and output.exists():
+            verify(output, meta["verified"])
+            move_no_replace(output, final)
+        verify(final, meta["verified"])
+        if str(final) != job["output"] or not meta.get("promoted"):
+            meta["promoted"] = True
+            with db:
+                db.execute("UPDATE jobs SET output=?, metadata=? WHERE torrent_hash=? AND source=?",
+                           (str(final), json.dumps(meta), h, name))
+                journal._insert_event(h, name, "promoted", str(final))
+    with db:
+        db.execute("UPDATE jobs SET status='done',completed_at=? WHERE torrent_hash=? AND status='validated' AND action='copy'",
+                   (utcnow().isoformat(), h))
+        db.execute("UPDATE retirements SET state='completed' WHERE torrent_hash=?", (h,))
+        journal._insert_event(h, "", "done", "Torrent retired and all selected media published")

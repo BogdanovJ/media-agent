@@ -168,7 +168,22 @@ class Purge:
 
         # A duplicate source means the journal cannot
         # establish which file should be retained.
-        if resolved_source.exists():
+        lifecycle = self.journal.db.execute(
+            "SELECT state FROM retirements WHERE torrent_hash=?", (torrent_hash,)
+        ).fetchone()
+        if lifecycle:
+            if lifecycle[0] != "completed":
+                result["reason"] = "Publication incomplete"
+                return result
+            current = self.journal.get(torrent_hash, source_name)
+            meta = current.get("metadata") or {}
+            output = Path(current["output"])
+            if (not meta.get("promoted") or output.resolve() != output
+                    or not output.is_file() or output.parent != resolved_source.parent
+                    or list(fingerprint(output)) != meta.get("verified")):
+                result["reason"] = "Published output identity changed"
+                return result
+        if resolved_source.exists() and not (lifecycle and output == resolved_source):
             result["reason"] = "Original source path exists again"
             return result
 

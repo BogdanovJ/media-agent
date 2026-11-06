@@ -3,17 +3,21 @@ import logging
 import os
 from pathlib import Path
 import shutil
-import subprocess
 import time
 import yaml
-from .compat import VIDEO_EXTS, decision
+from .compat import decision
+from .media import probe
+from .quarantine import is_within as within
+from . import worker
+from .jobs import submit
+from .paths import final_path, legacy_path, sources, work_dir, checked
 from .journal import Journal
 from .notifier import NotificationDispatcher, TelegramNotifier, TelegramSettings
 from .metrics import MetricsState, start_metrics
 from .cleanup import cleanup_expired
 from .qbit import Qbit
 from .publisher import finalize_torrent
-from .safe_move import move_no_replace
+
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s"
@@ -21,306 +25,100 @@ logging.basicConfig(
 log = logging.getLogger("media-agent")
 
 
-def probe(path):
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_streams",
-            "-show_format",
-            "-of",
-            "json",
-            str(path),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=120,
-    )
-    data = json.loads(result.stdout)
-    data["filename"] = str(path)
-    return data
+def approved(cfg, h):
+    allowed = cfg.get("retirement_allow_hashes", [])
+    if not isinstance(allowed, list):
+        raise ValueError("retirement_allow_hashes must be a list")
+    return (cfg.get("process_enabled") and cfg.get("finalize_enabled")
+            and (cfg.get("retire_all_completed") is True or h.lower() in {value.lower() for value in allowed}))
 
 
-def within(path, root):
-    p, r = Path(path).resolve(), Path(root).resolve()
-    return p != r and r in p.parents
-
-
-def destination_for(src, action):
-    """Return the final path without changing the source directory structure."""
-    src = Path(src)
-    if action == "copy":
-        return src  # Already compatible: no duplicate is necessary.
-    if action in ("remux", "transcode"):
-        # An MP4 container can still need audio/video conversion. Never use
-        # its original filename as the output (including case-insensitive FS).
-        if src.suffix.lower() == ".mp4":
-            return src.with_name(src.stem + ".media-agent.mp4")
-        return src.with_suffix(".mp4")
-    raise ValueError(f"Unsupported conversion action: {action}")
-
-
-def convert(src, dest, action, threads):
-    """
-    Convert a video and publish it only after validation.
-
-    The source is never modified.
-    The completed output is published without replacing an existing file.
-    """
-
-    dest.parent.mkdir(parents=True, exist_ok=True)
-
-    partial = dest.with_name(dest.stem + ".media-agent.partial" + dest.suffix)
-
-    if src == dest:
-        raise ValueError("Refusing to convert a source onto itself")
-    if dest.exists() or dest.is_symlink():
-        raise FileExistsError(f"Destination already exists: {dest}")
-    if partial.exists() or partial.is_symlink():
-        raise FileExistsError(f"Previous partial output requires inspection: {partial}")
-
-    source_info = probe(src)
-
-    try:
+def process_file(h, src, cfg, journal, root):
+    job = journal.get(h, str(src)) or {}
+    status = job.get("status")
+    if status in ("validated", "review", "quarantined", "purging", "purged"):
+        return
+    if not src.is_file():
+        journal.put(h, str(src), "missing", reason="Source not found")
+        return
+    candidate = None
+    if status == "done" and job["output"] != str(src):
+        candidate = legacy_path(src)
+        if job["output"] != str(candidate) or not candidate.is_file():
+            journal.put(h, str(src), "review", reason="Legacy output missing or unexpected")
+            return
+        action = job["action"]
+        reason = "Revalidating recorded legacy output"
+    elif status in ("queued", "failed", "interrupted") and (job.get("metadata") or {}).get("work"):
+        action = job["action"]
+        candidate = Path(job["metadata"]["candidate"]) if job["metadata"]["candidate"] else None
+        reason = "Resuming staged work"
+    else:
+        action, reason = decision(probe(src), src.stat().st_size, cfg["review_over_bytes"])
         if action == "copy":
-            shutil.copy2(src, partial)
-
-        elif action in ("remux", "transcode"):
-            cmd = [
-                "ffmpeg",
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "warning",
-                "-n",
-                "-i",
-                str(src),
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a:0",
-                "-c:v",
-                ("copy" if action == "remux" else "libx264"),
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-ac",
-                "2",
-                "-sn",
-                "-dn",
-                "-threads",
-                str(threads),
-                "-movflags",
-                "+faststart",
-                str(partial),
-            ]
-
-            subprocess.run(cmd, check=True)
-
-        else:
-            raise ValueError(f"Unsupported conversion action: {action}")
-
-        # --------------------------------------
-        # Validate output metadata
-        # --------------------------------------
-
-        output_info = probe(partial)
-
-        videos = [
-            s
-            for s in output_info["streams"]
-            if s["codec_type"] == "video"
-            and not s.get("disposition", {}).get("attached_pic")
-        ]
-
-        audios = [s for s in output_info["streams"] if s["codec_type"] == "audio"]
-
-        if len(videos) != 1 or len(audios) != 1:
-            raise RuntimeError("Output must contain one video " "and one audio stream")
-
-        if videos[0]["codec_name"] != "h264":
-            raise RuntimeError("Output video is not H.264")
-
-        if audios[0]["codec_name"] != "aac":
-            raise RuntimeError("Output audio is not AAC")
-
-        if int(audios[0].get("channels") or 0) != 2:
-            raise RuntimeError("Output audio is not stereo")
-
-        # --------------------------------------
-        # Validate duration
-        # --------------------------------------
-
-        source_duration = float(source_info["format"]["duration"])
-
-        output_duration = float(output_info["format"]["duration"])
-
-        tolerance = max(2.0, source_duration * 0.01)
-
-        if abs(source_duration - output_duration) > tolerance:
-            raise RuntimeError(
-                "Duration mismatch: "
-                f"source={source_duration:.2f}s, "
-                f"output={output_duration:.2f}s"
-            )
-
-        # --------------------------------------
-        # Decode complete output
-        # --------------------------------------
-
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-nostdin",
-                "-v",
-                "error",
-                "-xerror",
-                "-i",
-                str(partial),
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a:0",
-                "-f",
-                "null",
-                "-",
-            ],
-            check=True,
-        )
-
-        # --------------------------------------
-        # Publish verified output
-        # --------------------------------------
-
-        # Publish without overwriting a file that appeared during conversion.
-        # move_no_replace either performs a no-clobber move or fails safely.
-        move_no_replace(partial, dest)
-
-        log.info(
-            "Verified output: %s (%.2f seconds)",
-            dest,
-            output_duration,
-        )
-
-    except Exception:
-        log.exception(
-            "Processing or validation failed: %s",
-            src,
-        )
-
-        # Retain the incomplete output for inspection.
-        # It will never be published as a completed file.
-        raise
+            candidate = src
+    if action == "review" or not cfg["process_enabled"]:
+        if status != "done":
+            journal.put(h, str(src), "review" if action == "review" else "planned", action, reason)
+        return
+    if candidate is not None:
+        if candidate not in (legacy_path(src), src) or (candidate == src) != (action == "copy"):
+            raise ValueError("Invalid adoption candidate")
+        checked(candidate, root)
+    elif any(os.path.lexists(path) for path in {final_path(src), legacy_path(src)} - {src}):
+        journal.put(h, str(src), "review", action, "Unattributed output already exists")
+        return
+    directory = work_dir(root, h, src)
+    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    receipt = checked(directory / "validated.json", root)
+    failure = checked(directory / "review.txt", root)
+    if failure.exists():
+        journal.put(h, str(src), "review", action, failure.read_text()[:1000])
+        return
+    if not receipt.exists() and candidate is None and shutil.disk_usage(directory).free < cfg["min_free_bytes"]:
+        journal.put(h, str(src), "blocked", action, "Insufficient free space")
+        return
+    descriptor = dict(work=True, candidate=str(candidate or ""))
+    if status != "queued":
+        journal.put(h, str(src), "queued", action, reason, metadata=descriptor)
+    try:
+        if not receipt.exists():
+            if cfg.get("worker_jobs", False):
+                submit(root, directory, src, action, candidate)
+                return
+            worker.run(src, directory, action, candidate, cfg["ffmpeg_threads"])
+        result = json.loads(receipt.read_text())
+        if (result["source"], result["action"], result["candidate"]) != (str(src), action, descriptor["candidate"]):
+            raise ValueError("Staged result belongs to different work")
+        journal.put(h, str(src), "validated", action, "Media validated; awaiting torrent retirement",
+                    str(candidate or directory / "output.mp4"), metadata=result)
+    except Exception as exc:
+        journal.put(h, str(src), "failed", action, str(exc), metadata=descriptor)
+        log.exception("Processing failed: %s", src)
 
 
 def process_torrent(q, t, cfg, journal):
     h = t["hash"]
+    if journal.db.execute("SELECT 1 FROM retirements WHERE torrent_hash=?", (h,)).fetchone():
+        return  # Recovery is independent of the completed-torrent listing.
     root = Path(cfg["download_root"]).resolve()
-    # Output is deliberately published alongside the original source.
-    # Neither the quarantine directory nor any other special directory may be a source.
-    quarantine_root = Path(cfg["quarantine_root"]).resolve()
-    # qBittorrent file names are relative to the torrent's save_path.
-    base = Path(t["save_path"]).resolve()
-    if base != root and not within(base, root):
-        raise ValueError(f"Torrent save path outside configured download root: {base}")
-    entries = q.files(h)
-    for entry in entries:
-        if entry.get("priority") == 0:
-            continue
-        name = entry["name"]
-        candidate = base / name
-        if candidate.is_symlink():
-            raise ValueError(f"Refusing symlink source: {candidate}")
-        src = candidate.resolve()
-        # Ignore macOS AppleDouble metadata files (e.g. ._Movie.mkv).
-        if src.name.startswith("._") or src.name == ".DS_Store":
-            continue
-        if src.suffix.lower() not in VIDEO_EXTS:
-            continue
-        if (
-            not within(src, root)
-            or src == quarantine_root
-            or within(src, quarantine_root)
-        ):
-            raise ValueError(f"Unsafe source path: {src}")
-        existing_status = journal.status(h, str(src))
-        if existing_status == "done" and src.suffix.lower() == ".mp4":
-            job = journal.get(h, str(src))
-            if (job["action"] in ("remux", "transcode")
-                    and job["output"] == str(src)):
-                # Repair only the historical self-output shortcut. Successful
-                # conversions and deliberately unchanged files stay completed.
-                journal.put(
-                    h, str(src), "interrupted", action=job["action"],
-                    reason="Correcting earlier completion: conversion was skipped because "
-                           "output matched the original MP4. Rechecking for a separate output.",
-                )
-                existing_status = "interrupted"
-                log.warning("Requeued incorrect MP4 completion: %s", src)
-        # Do not regress protected journal states after originals are moved.
-        if existing_status in ("done", "review", "quarantined", "purging", "purged"):
-            continue
-        if not src.is_file():
-            journal.put(h, str(src), "missing", reason="Source not found")
-            continue
-        metadata = probe(src)
-        action, reason = decision(
-            metadata, src.stat().st_size, cfg["review_over_bytes"]
-        )
-        log.info("hash=%s file=%s decision=%s reason=%s", h, src, action, reason)
-        if action == "review":
-            journal.put(h, str(src), "review", action, reason)
-            continue
-        if not cfg["process_enabled"]:
-            journal.put(h, str(src), "planned", action, reason)
-            continue
-        dest = destination_for(src, action)
-        if action == "copy":
-            journal.put(h, str(src), "done", action,
-                        "Already compatible; original retained, no conversion needed.", str(src))
-            continue
-        if dest == src:
-            journal.put(h, str(src), "review", action,
-                        "Conversion output must differ from the original; no conversion performed.")
-            continue
-        if dest.exists() or dest.is_symlink():
-            journal.put(
-                h, str(src), "review", action, "Output already exists; manual review"
-            )
-            continue
-        if (
-            shutil.disk_usage(src.parent).free
-            < cfg["min_free_bytes"]
-        ):
-            journal.put(h, str(src), "blocked", action, "Insufficient free space")
-            continue
-        journal.put(h, str(src), "running", action, reason)
-        try:
-            convert(src, dest, action, cfg["ffmpeg_threads"])
-            journal.put(h, str(src), "done", action,
-                        f"Conversion completed and validated. Output: {dest}", str(dest))
-        except Exception as e:
-            log.exception("Conversion failed: %s", src)
-            journal.put(h, str(src), "failed", action, str(e))
-    # A completed torrent is NOT automatically eligible for retirement.
-    # Only per-hash operator approvals permit the coordinator to run.
-    allowed = cfg.get("retirement_allow_hashes", [])
-    if not isinstance(allowed, list):
-        raise ValueError("retirement_allow_hashes must be a list")
-    approved = h.lower() in {str(value).lower() for value in allowed}
-    if cfg.get("finalize_enabled", False) and approved:
-        if not cfg.get("process_enabled", False):
-            raise PermissionError("Cannot finalize with processing disabled")
-        log.info("Retirement explicitly approved for hash=%s", h)
-        finalize_torrent(
-            q, t, journal, root, quarantine_root,
-            finalize_enabled=True,
-            allow_torrent_retirement=True,
-            retention_days=cfg.get("cleanup_days", 7),
-        )
+    selected = sources(t, q.files(h), root, Path(cfg["quarantine_root"]).resolve())
+    for src in selected:
+        process_file(h, src, cfg, journal, root)
+    if approved(cfg, h) and selected and all(journal.status(h, str(s)) == "validated" for s in selected):
+        finalize_torrent(q, t, journal, root, cfg["quarantine_root"],
+                         finalize_enabled=True, allow_torrent_retirement=True)
+
+
+def recover(q, cfg, journal):
+    pending = journal.db.execute("SELECT torrent_hash,save_path FROM retirements WHERE state!='completed'")
+    for h, path in pending.fetchall():
+        if approved(cfg, h):
+            try:
+                finalize_torrent(q, dict(hash=h, save_path=path), journal, cfg["download_root"],
+                                 cfg["quarantine_root"], finalize_enabled=True, allow_torrent_retirement=True)
+            except Exception:
+                log.exception("Retirement recovery blocked: %s", h)
 
 
 def main():
@@ -350,6 +148,7 @@ def main():
                     os.environ["QBIT_USERNAME"],
                     os.environ["QBIT_PASSWORD"],
                 )
+                recover(q, cfg, journal)
                 for torrent in q.completed():
                     try:
                         process_torrent(q, torrent, cfg, journal)
