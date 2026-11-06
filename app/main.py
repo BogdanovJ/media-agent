@@ -141,7 +141,7 @@ def main():
         journal, TelegramNotifier(telegram_settings) if telegram_settings else None,
     )
     log.info(
-        "media-agent v0.1 started process_enabled=%s finalize_enabled=%s",
+        "media-agent v1.0.0 started process_enabled=%s finalize_enabled=%s",
         cfg["process_enabled"],
         cfg["finalize_enabled"],
     )

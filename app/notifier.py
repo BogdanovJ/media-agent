@@ -121,6 +121,8 @@ def format_notice(item):
     if source and source != "-":
         parts.append("Source: " + escape(Path(source).name))
         detail = detail.replace(source, Path(source).name)
+    if detail.startswith("Command '") and "returned non-zero exit status" in detail:
+        detail = "Media check failed. The journal has the full command and error."
     if detail:
         parts.append(escape(detail[:2700]))
     return "\n".join(parts)

@@ -67,3 +67,12 @@ def test_retirement_disabled_by_default(tmp_path):
     with pytest.raises(PermissionError, match="opt-in"):
         finalize_torrent(None, torrent, journal, root, root / "deleted", finalize_enabled=True)
     assert source.exists() and output.exists()
+
+
+def test_summary_distinguishes_adoption_from_new_work():
+    from app.publisher import completion_summary
+    files = [dict(source=f"/downloads/Season 3/show.s03e0{n}.mp4", action="remux",
+                  status="quarantined", metadata={"candidate": "legacy.mp4"}) for n in range(1, 4)]
+    summary = completion_summary(files)
+    assert "/downloads" not in summary and "show.s03e03.mp4" in summary
+    assert "3 existing outputs reused" in summary and "3 originals archived for 7 days" in summary

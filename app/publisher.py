@@ -1,5 +1,6 @@
 """Controller-only, replayable record removal, archival and publication."""
 import json
+from collections import Counter
 import os
 from datetime import timedelta
 from pathlib import Path
@@ -52,6 +53,27 @@ def plan_retirement(torrent, entries, journal, root, archive):
         verify(src, job["metadata"]["original"])
         verify(output, job["metadata"]["verified"])
     return [str(src) for src in selected]
+
+
+def completion_summary(files):
+    actions = {"copy": "already compatible", "remux": "remuxed", "transcode": "transcoded"}
+    counts = Counter()
+    for file in files:
+        label = actions[file["action"]]
+        if file["action"] != "copy" and (file.get("metadata") or {}).get("candidate"):
+            label = "existing output reused"
+        counts[label] += 1
+    steps = ", ".join(f"{count} {label.replace('output', 'outputs') if count > 1 else label}" for label, count in counts.items())
+    names = [Path(file["source"]).name for file in files]
+    sources = ", ".join(names[:3])
+    if len(names) > 3:
+        sources += f" (+{len(names)-3} more)"
+    archived = sum(file["status"] == "quarantined" for file in files)
+    result = "Torrent retired"
+    if archived:
+        unit = "original" if archived == 1 else "originals"
+        result += f" · {archived} {unit} archived for 7 days"
+    return f"Source: {sources}\nProgress: scanned → {steps} → verified\n{result}"
 
 
 def finalize_torrent(qbit, torrent, journal, download_root, quarantine_root, *,
@@ -140,15 +162,4 @@ def finalize_torrent(qbit, torrent, journal, download_root, quarantine_root, *,
                    (utcnow().isoformat(), h))
         db.execute("UPDATE retirements SET state='completed' WHERE torrent_hash=?", (h,))
         files = [journal.get(h, name) for name in selected]
-        actions = {"copy": "already compatible", "remux": "remuxed", "transcode": "transcoded"}
-        counts = [f"{n} {label}" for action, label in actions.items()
-                  if (n := sum(f["action"] == action for f in files))]
-        names = [Path(name).name for name in selected]
-        summary = ", ".join(names[:3])
-        if len(names) > 3:
-            summary += f" (+{len(names)-3} more)"
-        progress = "Scanned → " + ", ".join(counts) + " → verified → torrent retired"
-        archived = sum(f["status"] == "quarantined" for f in files)
-        if archived:
-            progress += f"\nPublished · {archived} original{'s' if archived != 1 else ''} archived for 7 days"
-        journal._insert_event(h, "", "done", f"Source: {summary}\n{progress}")
+        journal._insert_event(h, "", "done", completion_summary(files))
