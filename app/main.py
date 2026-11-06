@@ -36,7 +36,12 @@ def approved(cfg, h):
 def process_file(h, src, cfg, journal, root):
     job = journal.get(h, str(src)) or {}
     status = job.get("status")
-    if status in ("validated", "review", "quarantined", "purging", "purged"):
+    if status == "review":
+        # Re-evaluate legacy MP4s once under the chapter-aware validation rule.
+        if job["reason"] != "Output does not meet the Samsung MP4 profile" or not (job.get("metadata") or {}).get("work"):
+            return
+        status = "interrupted"
+    if status in ("validated", "quarantined", "purging", "purged"):
         return
     if not src.is_file():
         journal.put(h, str(src), "missing", reason="Source not found")
@@ -71,8 +76,10 @@ def process_file(h, src, cfg, journal, root):
     directory = work_dir(root, h, src)
     directory.mkdir(parents=True, mode=0o700, exist_ok=True)
     receipt = checked(directory / "validated.json", root)
-    failure = checked(directory / "review.txt", root)
+    failure = checked(directory / "review-v2.txt", root)
     if failure.exists():
+        if job.get("status") == "review":
+            return
         journal.put(h, str(src), "review", action, failure.read_text()[:1000])
         return
     if not receipt.exists() and candidate is None and shutil.disk_usage(directory).free < cfg["min_free_bytes"]:

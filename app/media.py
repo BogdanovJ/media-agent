@@ -18,6 +18,7 @@ def probe(path):
             "error",
             "-show_streams",
             "-show_format",
+            "-show_chapters",
             "-of",
             "json",
             str(path),
@@ -114,7 +115,12 @@ def convert(src, dest, action, threads):
 
 def validate(source_info, partial):
     output_info = probe(partial)
-    if "mp4" not in output_info["format"]["format_name"].split(",") or decision(output_info, 0)[0] != "copy":
+    # FFmpeg represents QuickTime chapter titles as an auxiliary timed-text track.
+    streams = [s for s in output_info["streams"] if not (
+        output_info.get("chapters") and s.get("codec_type") == "data"
+        and s.get("codec_name") == "bin_data" and s.get("codec_tag_string") == "text"
+    )]
+    if "mp4" not in output_info["format"]["format_name"].split(",") or decision(dict(output_info, streams=streams), 0)[0] != "copy":
         raise ValueError("Output does not meet the Samsung MP4 profile")
     source_duration = float(source_info["format"]["duration"])
 

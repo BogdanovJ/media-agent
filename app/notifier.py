@@ -7,6 +7,8 @@ and delivery attempts across restarts.
 
 from __future__ import annotations
 
+from html import escape
+from pathlib import Path
 import json
 import logging
 import os
@@ -50,13 +52,16 @@ class TelegramNotifier:
         self._open = opener or urlopen
         self._sleep = sleep or time.sleep
 
-    def send(self, event: str, message: str) -> bool:
+    def send(self, event: str, message: str, *, formatted=False) -> bool:
         """Return delivery success; failures are logged, never raised to the caller.
 
         Call this outside any SQLite transaction or filesystem-critical section.
         """
-        body = f"Media Agent — {event}\n{message}"[:4096]
-        data = urlencode({"chat_id": self.settings.chat_id, "text": body}).encode("utf-8")
+        body = message if formatted else f"Media Agent — {event}\n{message}"[:4096]
+        fields = {"chat_id": self.settings.chat_id, "text": body}
+        if formatted:
+            fields["parse_mode"] = "HTML"
+        data = urlencode(fields).encode("utf-8")
         # The token is transmitted only over HTTPS and is not logged.
         request = Request(
             f"https://api.telegram.org/bot{self.settings.bot_token}/sendMessage",
@@ -96,6 +101,31 @@ class TelegramNotifier:
         return False
 
 
+def format_notice(item):
+    """Render the immutable outbox snapshot, including pre-upgrade messages."""
+    labels = {"done": "Complete", "review": "Needs review", "failed": "Failed",
+              "blocked": "Blocked", "missing": "Missing source", "cleanup_failed": "Cleanup blocked",
+              "purged": "Archive expired", "quarantined": "Archived", "torrent_retired": "Retired",
+              "interrupted": "Interrupted"}
+    state = labels.get(item["event"], item["event"])
+    attempt = item["attempts"]
+    header = f"<b>Media Agent #{item['event_id']} · {escape(state)}</b>"
+    delivery = f"Attempt {attempt}" + (" · possible duplicate" if attempt > 1 else "")
+    lines = item["message"].split("\n", 2)
+    if len(lines) < 2 or not lines[0].startswith("Torrent: ") or not lines[1].startswith("Source: "):
+        return f"{header}\n{delivery}\n{escape(item['message'][:3000])}"
+    torrent = lines[0].removeprefix("Torrent: ")
+    source = lines[1].removeprefix("Source: ")
+    detail = lines[2] if len(lines) == 3 else ""
+    parts = [header, f"{delivery} · Hash <code>{escape(torrent[-5:])}</code>"]
+    if source and source != "-":
+        parts.append("Source: " + escape(Path(source).name))
+        detail = detail.replace(source, Path(source).name)
+    if detail:
+        parts.append(escape(detail[:2700]))
+    return "\n".join(parts)
+
+
 class NotificationDispatcher:
     """Drain a bounded batch, keeping all network calls outside transactions.
 
@@ -125,11 +155,7 @@ class NotificationDispatcher:
                 if item is None:
                     break
                 try:
-                    notice = f"Event #{item['event_id']} | delivery attempt {item['attempts']}\n"
-                    if item['attempts'] > 1:
-                        notice += ("RETRY — possible duplicate. An earlier delivery may have succeeded "
-                                   "without confirmation; the same event ID is not a new media action.\n")
-                    delivered = self.notifier.send(item["event"], notice + item["message"]) is True
+                    delivered = self.notifier.send(item["event"], format_notice(item), formatted=True) is True
                 except Exception:
                     # An injected transport can raise unexpected exceptions.
                     # Do not log arbitrary exception text containing credentials.

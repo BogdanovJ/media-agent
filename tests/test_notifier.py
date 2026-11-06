@@ -126,3 +126,12 @@ def test_malformed_json_shapes_fail_closed(payload):
     notifier = TelegramNotifier(settings(), opener=opener, sleep=lambda _s: None)
     assert notifier.send("Completed", "A.mp4") is False
     assert len(calls) == 1
+
+
+def test_compact_notice_escapes_filename_and_uses_short_monospace_hash():
+    from app.notifier import format_notice
+    msg = format_notice(dict(event_id=44, event="review", attempts=2,
+                             message="Torrent: 123456789abcd\nSource: /downloads/A&B <film>.mkv\nAudio missing"))
+    assert "<code>9abcd</code>" in msg and "12345678" not in msg
+    assert "Media Agent #44 · Needs review" in msg and "Attempt 2 · possible duplicate" in msg
+    assert "A&amp;B &lt;film&gt;.mkv" in msg and "/downloads" not in msg

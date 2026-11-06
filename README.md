@@ -77,7 +77,7 @@ Flux to deploy. Do not deploy placeholder credentials.
 
 ## Telegram uncertainty and fallback
 
-Every delivered message includes a stable **event ID** and attempt number. Retried deliveries additionally say **possible duplicate** and explain that the same event ID is not a new media action. A crash or lost response can leave delivery uncertain; exactly-once delivery is not possible with this send/acknowledge sequence. Even internal HTTP retries within one attempt can duplicate a message, so compare event IDs rather than attempt numbers alone.
+Telegram sends one summary per published torrent plus actionable exceptions. It shows the event ID, delivery attempt, last five hash characters, filenames and processing milestones. Intermediate retirement, archival and purge events stay in the full SQLite journal. Retried deliveries additionally say **possible duplicate** and explain that the same event ID is not a new media action. A crash or lost response can leave delivery uncertain; exactly-once delivery is not possible with this send/acknowledge sequence. Even internal HTTP retries within one attempt can duplicate a message, so compare event IDs rather than attempt numbers alone.
 
 The SQLite journal on the persistent `media-agent-journal` volume is the fallback record. No old event history is replayed when the outbox schema is introduced. Pending messages survive restarts and retry with a delay from 60 seconds up to one hour. Delivered rows remain for audit. Retries are handled after each polling cycle, so long conversions can delay delivery.
 

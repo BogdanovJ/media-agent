@@ -23,3 +23,19 @@ def test_actual_staged_output_decodes(tmp_path, action, codec):
         f.truncate(100)
     with pytest.raises((ValueError, subprocess.CalledProcessError)):
         validate(probe(source), output)
+
+
+def test_quicktime_chapter_track_is_accepted_only_with_chapters(monkeypatch):
+    from app import media
+    from types import SimpleNamespace
+    video = dict(codec_type="video", codec_name="h264", pix_fmt="yuv420p", width=1920, height=1080, level=40)
+    audio = dict(codec_type="audio", codec_name="aac", channels=2, profile="LC")
+    chapter = dict(codec_type="data", codec_name="bin_data", codec_tag_string="text")
+    info = dict(filename="out.mp4", streams=[video, audio, chapter], chapters=[dict(id=1)],
+                format=dict(format_name="mov,mp4", duration="120"))
+    monkeypatch.setattr(media, "probe", lambda _: info)
+    monkeypatch.setattr(media.subprocess, "run", lambda *_a, **_kw: SimpleNamespace(returncode=0))
+    media.validate(info, "out.mp4")
+    info["chapters"] = []
+    with pytest.raises(ValueError):
+        media.validate(info, "out.mp4")

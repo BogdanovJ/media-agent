@@ -24,8 +24,7 @@ JOB_STATUSES = {
 }
 
 NOTIFICATION_EVENTS = {
-    "done", "failed", "review", "blocked", "missing", "interrupted",
-    "quarantined", "purged", "torrent_retired", "cleanup_failed",
+    "done", "failed", "review", "blocked", "missing", "cleanup_failed",
 }
 
 

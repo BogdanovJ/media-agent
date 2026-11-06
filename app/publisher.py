@@ -139,4 +139,16 @@ def finalize_torrent(qbit, torrent, journal, download_root, quarantine_root, *,
         db.execute("UPDATE jobs SET status='done',completed_at=? WHERE torrent_hash=? AND status='validated' AND action='copy'",
                    (utcnow().isoformat(), h))
         db.execute("UPDATE retirements SET state='completed' WHERE torrent_hash=?", (h,))
-        journal._insert_event(h, "", "done", "Torrent retired and all selected media published")
+        files = [journal.get(h, name) for name in selected]
+        actions = {"copy": "already compatible", "remux": "remuxed", "transcode": "transcoded"}
+        counts = [f"{n} {label}" for action, label in actions.items()
+                  if (n := sum(f["action"] == action for f in files))]
+        names = [Path(name).name for name in selected]
+        summary = ", ".join(names[:3])
+        if len(names) > 3:
+            summary += f" (+{len(names)-3} more)"
+        progress = "Scanned → " + ", ".join(counts) + " → verified → torrent retired"
+        archived = sum(f["status"] == "quarantined" for f in files)
+        if archived:
+            progress += f"\nPublished · {archived} original{'s' if archived != 1 else ''} archived for 7 days"
+        journal._insert_event(h, "", "done", f"Source: {summary}\n{progress}")

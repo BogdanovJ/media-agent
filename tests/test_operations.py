@@ -82,9 +82,9 @@ def test_retried_message_explains_uncertainty_with_stable_id(journal):
     dispatcher.dispatch()
     retry = notifier.send.call_args.args[1]
     event_id = journal.db.execute('SELECT event_id FROM notification_outbox').fetchone()[0]
-    assert f'Event #{event_id}' in first and f'Event #{event_id}' in retry
+    assert f'Media Agent #{event_id}' in first and f'Media Agent #{event_id}' in retry
     assert 'possible duplicate' not in first
-    assert 'possible duplicate' in retry and 'not a new media action' in retry
+    assert 'possible duplicate' in retry and 'Attempt 2' in retry
 
 
 @pytest.fixture

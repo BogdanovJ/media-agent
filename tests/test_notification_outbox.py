@@ -36,7 +36,7 @@ def test_selected_events_queued_atomically(journal, event):
     assert journal.db.execute('SELECT event FROM events WHERE id=?', (item['event_id'],)).fetchone() == (event,)
 
 
-@pytest.mark.parametrize('event', ['planned', 'running', 'quarantine_intent', 'purge_intent', 'fingerprinted'])
+@pytest.mark.parametrize('event', ['planned', 'running', 'quarantine_intent', 'purge_intent', 'fingerprinted', 'quarantined', 'purged', 'torrent_retired', 'interrupted'])
 def test_routine_events_not_queued(journal, event):
     journal.event('hash', '/movie', event)
     assert rows(journal) == []
@@ -153,14 +153,16 @@ def test_restart_recovery_queues_once(tmp_path):
     for _ in range(2):
         current = Journal(path)
         assert current.status('hash', '/movie') == 'interrupted'
-        assert [r['event'] for r in rows(current)] == ['interrupted']
+        assert rows(current) == []
+        assert current.db.execute("SELECT count(*) FROM events WHERE event='interrupted'").fetchone() == (1,)
         current.close()
 
 
 def test_success_outside_transaction_never_resent(journal):
     journal.event('hash', '/movie', 'done')
     notifier = sender()
-    def send(event, message):
+    def send(event, message, *, formatted):
+        assert formatted
         assert not journal.db.in_transaction
         assert event == 'done'
         return True
